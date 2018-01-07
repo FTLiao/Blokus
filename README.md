@@ -1,4 +1,4 @@
-** The game is implemented by FengTing Liao and ShengHsiung Hsieh. If any further development of your own game based on the library of the code here, please give the credit to this page.
+** The game is implemented by FengTing Liao and ShengHsiung Hsieh. If any further development of your own game based on the library of the code here, please reference this page.
 
 
 
