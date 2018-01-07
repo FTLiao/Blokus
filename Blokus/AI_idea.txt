@@ -1,0 +1,65 @@
+//
+//5-19
+//
+AI初步構想
+
+新增Board	int EDGESCORE[4] 紀錄edge的延展分數(最大)
+
+AI.h
+
+(每一時期皆已5>4>3>2>1，放置順序為優先考量)
+
+前期4	Period_A
+	1.接點往中間(設定幾個開局的Block)
+	2.
+中期5-9	Period_B
+	1.穿透與延伸	高分	
+	2.檔人		低分
+	3.以為己有	扣重
+後期9-21Period_C
+	1.檔人		高分
+	2.穿透延伸	低分
+	3.以為己有	扣輕
+
+每個edge的分數為零時，代表玩家無法放置方塊。
+
+//
+//6/8
+//
+
+用recursive 去計算面積
+
+//
+//6/10
+//
+
+class Calput
+1.先放放看! 每一個edge~ turn flip
+
+在edge上把Dlist(要放的方塊的D) 配合算出方塊中心點
+
+edge(x,y)+dlist(block) - 3 = i,jput (滑鼠指標放放看)
+
+放置到futureboard上--> D onboard Dlist放放看方塊的所有大D位置
+
+rule1 : ESD存在否? yes+100 no+0
+rule2 : rule滿足，edge是否有至少一個#
+rule3 : rule滿足與否，皆要執行計算延伸面積 recursive function
+
+
+//
+//6-17
+//
+end game
+1.最小piece找起
+2.eonboard
+3.dlist->turn flip->iput jput
+4.一可以放就break PCAI = -1
+5.當setindex >10 開始
+
+//
+//6-18
+//
+完成往中間走的randput
+
+dlist似乎有些問題~~QQ

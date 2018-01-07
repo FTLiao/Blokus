@@ -1,0 +1,181 @@
+# # # # # # # 
+# # # # # # # 
+# # e s e # #
+# # s D s # #
+# # e s e # # 
+# # # # # # # 
+# # # # # # #
+
+# # # # # # # 
+# # # # # # # 
+# # e s e # #
+# # s D s # #
+# # s D s # # 
+# # e s e # # 
+# # # # # # #
+
+# # # # # # #
+# # # # # # #
+# # e s s e #
+# # s D D s #
+# # s D s e #
+# # e s e # #
+# # # # # # #
+
+
+# # # # # # #
+# # # # # # #
+# # e s e # #
+# # s D s # #
+# # s d s # # 
+# # s D s # # 
+# # e s e # #
+
+# # # # # # #
+# # # # # # #
+# # e s s e #
+# # s D D s #
+# # s D D s #
+# # e s s e #
+# # # # # # #
+
+# # # # # # #
+# # # # # # #
+# # e s e # #
+# # s D s e #
+# # s D D s #
+# # e s D s #
+# # # e s e #
+
+
+
+# # # # # # #
+# # e s e # #
+# # s D s # #
+# # s d s # #
+# # s d s # # 
+# # s D s # # 
+# # e s e # #
+
+# # # # # # # 
+# # # # # # # 
+# # e s e # # 
+# # s D s e # 
+# # s d D s #
+# # s D s e #
+# # e s e # #
+
+# # # # # # #
+# # # # # # #
+# # e s s e #
+# # s D D s #
+# # s d s e #
+# # s D s # #
+# # e s e # #
+
+# # # # # # #
+# # e s e # # 
+# # s D s e #  
+# # s d D s # 
+# # s d s e # 
+# # s D s # #  
+# # e s e # # 
+
+# # # # # # # 
+# # e s s e #  
+# # s D D s #  
+# # s d s e # 
+# # s d s # # 
+# # s D s # #  
+# # e s e # # 
+
+# # e s e # # 
+# # s D s # #
+# # s d s # # 
+# # s d s # # 
+# # s d s # #
+# # s D s # # 
+# # e s e # # 
+
+# # # # # # # 
+# # # # # # # 
+# # e s s e #  
+# # s D D s #  
+# # s d s e # 
+# # s D D s # 
+# # e s s e # 
+
+# # # # # # # 
+# # e s s e #
+# # s D D s #
+# # s d D s #
+# # s D s e #
+# # e s e # #
+# # # # # # #
+
+
+# # # # # # #
+# e s e # # #
+# s D s e # #
+# s D D s e #
+# e s D D s #
+# # e s s e #
+# # # # # # #
+
+# # # # # # #
+# e s s e # #
+# s D D s e #
+# e s d D s #
+# # s D s e #
+# # e s e # #
+# # # # # # #
+
+# # # # # # # 
+# e s s e # # 
+# s D D s # #
+# e s d s e #
+# # s D D s #
+# # e s s e #
+# # # # # # # 
+
+# # # # # # # 
+# # e s e # # 
+# # s D s e # 
+# # s D D s # 
+# # e s d s # 
+# # # s D s # 
+# # # e s e # 
+
+# # # # # # #
+# # e s e # #  
+# e s D s e #  
+# s D d D s # 
+# e s D s e # 
+# # e s e # # 
+# # # # # # # 
+
+# # # # # # # 
+# e s s s e # 
+# s D d D s #  
+# e s d s e # 
+# # s D s # # 
+# # e s e # #  
+# # # # # # # 
+
+
+# # # # # # # 
+# e s s s e #  
+# s D d D s #  
+# s d s s e # 
+# s D s # # # 
+# e s e # # #  
+# # # # # # # 
+
+
+
+
+
+
+
+
+
