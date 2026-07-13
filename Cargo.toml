@@ -1,0 +1,20 @@
+[package]
+name = "blokus"
+version = "1.0.0"
+edition = "2024"
+description = "Blokus board game — Rust rewrite with a stronger AI"
+
+[dependencies]
+macroquad = "0.4.15"
+
+[lib]
+name = "blokus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "blokus"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
