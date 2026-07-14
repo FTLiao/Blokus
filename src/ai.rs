@@ -13,11 +13,11 @@
 //! Everything is bitboard-based, so a full evaluation of the thousands of
 //! opening moves takes a few milliseconds.
 
-use crate::game::{Bits, GameState, Move, N, ROW_MASK};
+use crate::game::{Bits, GameState, Move, N, ROW_MASK, TOTAL_SQUARES};
 use crate::pieces::pieces;
+use std::time::Instant;
 
-/// Simple xorshift so we don't need an RNG dependency; only used to break
-/// ties between equally-scored moves.
+/// Simple xorshift so we don't need an RNG dependency.
 pub struct Rng(pub u64);
 
 impl Rng {
@@ -26,6 +26,18 @@ impl Rng {
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         self.0
+    }
+
+    /// Uniform f64 in (0, 1).
+    fn uniform(&mut self) -> f64 {
+        ((self.next() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+
+    /// Standard Gumbel noise: adding it to scores and taking the argmax
+    /// samples from the softmax of the scores (perturb-and-max trick).
+    fn gumbel(&mut self) -> f64 {
+        let u = self.uniform();
+        -(-u.ln()).ln()
     }
 }
 
@@ -118,31 +130,227 @@ fn evaluate(gs: &GameState, p: usize, mv: &Move, ctx: &Ctx) -> i32 {
     piece_size * 90 + my_corners * 14 + blocked * 28 + center_bonus * center_w
 }
 
-/// Pick the best move for player `p`, or None if there is no legal move.
+/// Moves scoring within this many eval points of the best are treated as
+/// interchangeable by the greedy policy; picking uniformly among them keeps
+/// games (especially openings) from always starting identically.
+const GREEDY_TOLERANCE: i32 = 25;
+
+/// Pick a near-best move for player `p`, or None if there is no legal move.
+/// Instead of a strict argmax, this samples uniformly among all moves within
+/// `GREEDY_TOLERANCE` eval points of the best, so play varies between games.
 pub fn choose_move(gs: &GameState, p: usize, rng: &mut Rng) -> Option<Move> {
     let moves = gs.legal_moves(p);
     if moves.is_empty() {
         return None;
     }
     let ctx = build_ctx(gs, p);
-    let mut best: Option<Move> = None;
-    let mut best_score = i32::MIN;
-    let mut ties = 0u64;
-    for mv in moves {
-        let s = evaluate(gs, p, &mv, &ctx);
-        if s > best_score {
-            best_score = s;
-            best = Some(mv);
-            ties = 1;
-        } else if s == best_score {
-            // Reservoir sampling over tied moves for variety between games.
-            ties += 1;
-            if rng.next() % ties == 0 {
-                best = Some(mv);
+    let scores: Vec<i32> = moves.iter().map(|mv| evaluate(gs, p, mv, &ctx)).collect();
+    let best = *scores.iter().max().unwrap();
+    // Reservoir sampling over the near-best moves.
+    let mut pick: Option<Move> = None;
+    let mut count = 0u64;
+    for (i, &s) in scores.iter().enumerate() {
+        if s + GREEDY_TOLERANCE >= best {
+            count += 1;
+            if rng.next() % count == 0 {
+                pick = Some(moves[i]);
             }
         }
     }
+    pick
+}
+
+/// Search effort for the strong AI.
+#[derive(Clone, Copy, Debug)]
+pub enum Budget {
+    /// Wall-clock thinking time.
+    Millis(u64),
+    /// Fixed number of bandit iterations (deterministic-ish; used in tests).
+    Iterations(u32),
+}
+
+// ---- Strong AI: time-budgeted UCB1 bandit over candidate moves ----------
+
+/// Number of top statically-scored moves kept as bandit arms.
+const TOP_K: usize = 40;
+/// UCB1 exploration constant (values live in [0,1]).
+const UCB_C: f64 = 0.45;
+/// Virtual visits seeding each arm from its normalized static score, so the
+/// first pulls follow the heuristic ordering.
+const PRIOR_N: f64 = 2.0;
+/// Rollout horizon in plies after the arm move (~2 full rounds).
+const ROLLOUT_PLIES: u32 = 8;
+/// Gumbel noise scale (in eval units) for the noisy-greedy rollout policy.
+const GUMBEL_SCALE: f64 = 25.0;
+/// In rollouts, evaluate at most this many (randomly sampled) legal moves.
+const ROLLOUT_MOVE_CAP: usize = 96;
+
+/// Pick a move for the current rollout player: greedy over the static eval
+/// plus Gumbel noise, so repeated rollouts explore different lines.
+fn rollout_move(gs: &GameState, p: usize, rng: &mut Rng) -> Option<Move> {
+    let moves = gs.legal_moves(p);
+    if moves.is_empty() {
+        return None;
+    }
+    let ctx = build_ctx(gs, p);
+    let mut best: Option<Move> = None;
+    let mut best_s = f64::NEG_INFINITY;
+    let n = moves.len();
+    let consider = |mv: &Move, rng: &mut Rng, best: &mut Option<Move>, best_s: &mut f64| {
+        let s = evaluate(gs, p, mv, &ctx) as f64 + GUMBEL_SCALE * rng.gumbel();
+        if s > *best_s {
+            *best_s = s;
+            *best = Some(*mv);
+        }
+    };
+    if n <= ROLLOUT_MOVE_CAP {
+        for mv in &moves {
+            consider(mv, rng, &mut best, &mut best_s);
+        }
+    } else {
+        for _ in 0..ROLLOUT_MOVE_CAP {
+            let mv = moves[(rng.next() % n as u64) as usize];
+            consider(&mv, rng, &mut best, &mut best_s);
+        }
+    }
     best
+}
+
+/// Leaf value from `p`'s perspective, in [0, 1].
+fn leaf_value(gs: &GameState, p: usize) -> f64 {
+    if gs.is_over() {
+        let my = gs.score(p) as f64;
+        let best_opp = (0..4).filter(|&o| o != p).map(|o| gs.score(o)).max().unwrap() as f64;
+        return 0.5 + 0.5 * ((my - best_opp) / 12.0).tanh();
+    }
+    // Mid-game proxy: squares already placed plus mobility (open seeds),
+    // measured against the strongest opponent still in the game.
+    let potential = |q: usize| -> f64 {
+        (TOTAL_SQUARES - gs.squares_remaining(q)) as f64 + 0.4 * gs.seed_count(q) as f64
+    };
+    let opp_best = (0..4)
+        .filter(|&o| o != p && gs.active[o])
+        .map(potential)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let opp_best = if opp_best.is_finite() {
+        opp_best
+    } else {
+        (0..4).filter(|&o| o != p).map(potential).fold(f64::NEG_INFINITY, f64::max)
+    };
+    0.5 + 0.5 * ((potential(p) - opp_best) / 12.0).tanh()
+}
+
+/// One Monte-Carlo rollout: play `mv`, then ~`ROLLOUT_PLIES` plies where every
+/// player follows the noisy-greedy policy; return the leaf value for `p`.
+fn rollout_value(root: &GameState, p: usize, mv: &Move, rng: &mut Rng) -> f64 {
+    let mut gs = root.clone();
+    gs.apply(p, mv);
+    gs.advance_turn();
+    for _ in 0..ROLLOUT_PLIES {
+        if gs.is_over() {
+            break;
+        }
+        let cur = gs.current;
+        match rollout_move(&gs, cur, rng) {
+            Some(m) => gs.apply(cur, &m),
+            // advance_turn() only stops on players with a move, so this is
+            // unreachable in practice; deactivate defensively.
+            None => gs.active[cur] = false,
+        }
+        gs.advance_turn();
+    }
+    leaf_value(&gs, p)
+}
+
+/// Strong AI entry point: UCB1 bandit search over candidate moves within the
+/// given budget. `Millis(0)` falls back to the fast greedy policy.
+pub fn choose_move_strong(gs: &GameState, p: usize, budget: Budget, rng: &mut Rng) -> Option<Move> {
+    if let Budget::Millis(0) = budget {
+        return choose_move(gs, p, rng);
+    }
+    let moves = gs.legal_moves(p);
+    match moves.len() {
+        0 => return None,
+        1 => return Some(moves[0]),
+        _ => {}
+    }
+
+    // Candidate arms: top K moves by static eval.
+    let ctx = build_ctx(gs, p);
+    let mut scored: Vec<(i32, Move)> =
+        moves.iter().map(|mv| (evaluate(gs, p, mv, &ctx), *mv)).collect();
+    scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+    scored.truncate(TOP_K);
+
+    struct Arm {
+        mv: Move,
+        n: f64,
+        sum: f64,
+    }
+    // Seed each arm with a virtual prior from its normalized static score
+    // (plus tiny jitter so equal-scored openings don't tie deterministically).
+    let s_max = scored[0].0 as f64;
+    let s_min = scored.last().unwrap().0 as f64;
+    let span = (s_max - s_min).max(1.0);
+    let mut arms: Vec<Arm> = scored
+        .iter()
+        .map(|&(s, mv)| {
+            let prior =
+                0.35 + 0.3 * (s as f64 - s_min) / span + 0.02 * (rng.uniform() - 0.5);
+            Arm { mv, n: PRIOR_N, sum: PRIOR_N * prior }
+        })
+        .collect();
+
+    let start = Instant::now();
+    let mut total = 0f64;
+    let mut iters = 0u32;
+    loop {
+        match budget {
+            Budget::Millis(ms) => {
+                if start.elapsed().as_millis() as u64 >= ms {
+                    break;
+                }
+            }
+            Budget::Iterations(n) => {
+                if iters >= n {
+                    break;
+                }
+            }
+        }
+        // UCB1 arm selection.
+        let ln_t = (total + 1.0).ln();
+        let mut pick = 0;
+        let mut pick_u = f64::NEG_INFINITY;
+        for (i, a) in arms.iter().enumerate() {
+            let u = a.sum / a.n + UCB_C * (ln_t / (a.n + 1.0)).sqrt();
+            if u > pick_u {
+                pick_u = u;
+                pick = i;
+            }
+        }
+        let v = rollout_value(gs, p, &arms[pick].mv, rng);
+        arms[pick].n += 1.0;
+        arms[pick].sum += v;
+        total += 1.0;
+        iters += 1;
+    }
+
+    // Final selection: most-visited arm. Arms within 90% of the top visit
+    // count are statistically indistinguishable after this few rollouts, so
+    // pick uniformly among them (this keeps openings varied between games);
+    // break exact ties by mean value.
+    let n_max = arms.iter().map(|a| a.n).fold(0.0, f64::max);
+    let near: Vec<&Arm> = arms.iter().filter(|a| a.n >= 0.9 * n_max).collect();
+    if near.len() > 1 {
+        return Some(near[(rng.next() % near.len() as u64) as usize].mv);
+    }
+    arms.iter()
+        .max_by(|a, b| {
+            (a.n, a.sum / a.n)
+                .partial_cmp(&(b.n, b.sum / b.n))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|a| a.mv)
 }
 
 /// A deliberately weak baseline: uniformly random legal move. Used in tests
@@ -215,5 +423,64 @@ mod tests {
             strong_wins >= games * 3 / 4,
             "strong AI only won {strong_wins}/{games} against random"
         );
+    }
+
+    /// Play one game where the flagged seats use the bandit search and the
+    /// rest use plain greedy; returns final scores.
+    fn play_game_bandit(bandit: [bool; 4], iters: u32, seed: u64) -> [i32; 4] {
+        let mut gs = GameState::new();
+        let mut rng = Rng(seed | 1);
+        loop {
+            let p = gs.current;
+            let mv = if bandit[p] {
+                choose_move_strong(&gs, p, Budget::Iterations(iters), &mut rng)
+            } else {
+                choose_move(&gs, p, &mut rng)
+            };
+            match mv {
+                Some(mv) => gs.apply(p, &mv),
+                None => gs.active[p] = false,
+            }
+            gs.advance_turn();
+            if gs.is_over() {
+                break;
+            }
+        }
+        [gs.score(0), gs.score(1), gs.score(2), gs.score(3)]
+    }
+
+    #[test]
+    fn bandit_search_beats_greedy() {
+        let games = 4;
+        let mut wins = 0;
+        let mut margin = 0i32;
+        for seed in 0..games {
+            // Bandit plays Blue and Red, greedy plays Yellow and Green.
+            let s = play_game_bandit([true, false, true, false], 200, seed * 13 + 5);
+            if s[0].max(s[2]) > s[1].max(s[3]) {
+                wins += 1;
+            }
+            margin += s[0] + s[2] - s[1] - s[3];
+        }
+        // The bandit should win a clear majority and be ahead on total score;
+        // thresholds are loose enough to be stable across seeds.
+        assert!(wins >= games / 2, "bandit only won {wins}/{games} vs greedy");
+        assert!(margin > 0, "bandit behind greedy on total score ({margin})");
+    }
+
+    #[test]
+    fn millis_budget_is_respected() {
+        let gs = GameState::new();
+        let mut rng = Rng(42);
+        let t0 = std::time::Instant::now();
+        let mv = choose_move_strong(&gs, 0, Budget::Millis(150), &mut rng);
+        let dt = t0.elapsed();
+        assert!(mv.is_some());
+        // One rollout past the deadline is possible, but nothing more.
+        assert!(dt.as_millis() < 600, "Millis(150) took {dt:?}");
+        // Millis(0) must fall straight back to greedy.
+        let t0 = std::time::Instant::now();
+        assert!(choose_move_strong(&gs, 0, Budget::Millis(0), &mut rng).is_some());
+        assert!(t0.elapsed().as_millis() < 250);
     }
 }

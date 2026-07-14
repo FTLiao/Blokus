@@ -1,0 +1,399 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage{microtype}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\textbf{Blokus v2: A Bitboard Engine and a Budgeted\\ Bandit-Search AI}\\[6pt]
+\large Technical Report}
+\author{Feng-Ting Liao}
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe the engine and artificial intelligence of \emph{Blokus v2}, a Rust
+implementation of the four-player board game Blokus. The rules engine encodes
+the official $20\times 20$ board as per-player bitboards, reducing legality
+testing and full legal-move enumeration to word-parallel bit operations
+($\approx$0.2\,ms per move including evaluation). On top of the engine we
+build two policies: (i) a fast heuristic policy that scores every legal move
+on piece size, corner mobility, opponent-corner denial, and early-game
+centrality; and (ii) a strong policy that treats move selection as a budgeted
+multi-armed bandit problem, allocating Monte-Carlo rollouts across the top-$K$
+heuristic candidates with UCB1 and returning the most-visited arm when a
+wall-clock budget expires. In head-to-head evaluation the bandit policy
+defeats the heuristic policy in 11 of 12 four-player games while honoring a
+one-second decision budget to within a single iteration. The system exposes
+the budget to players directly as a ``think-time'' dial ($0$--$5$\,s) in the
+game's interface.
+\end{abstract}
+
+\section{Introduction}
+
+Blokus is a four-player perfect-information territory game played with
+polyomino pieces. Its branching factor is unusually punishing: an opening
+position offers each player on the order of $10^3$ legal placements, and
+placements interact through both denial (occupying cells opponents need) and
+mobility (creating one's own future placement anchors). These properties make
+Blokus a pleasant middle ground between classic two-player search domains and
+modern multi-agent settings: strong play requires lookahead, but the
+four-player, single-move-per-turn structure defeats naive minimax.
+
+This report documents the second major version of the project. Version~1 was
+a C++ course project at National Chiao Tung University (now National Yang
+Ming Chiao Tung University) by Feng-Ting Liao and ShengHsiung Hsieh; its AI
+scanned a $14\times 14$ window around a single frontier cell and placed
+near-randomly in the opening. Version~2 is a ground-up Rust rewrite whose AI
+is the subject of this report. We cover the board representation
+(Section~\ref{sec:engine}), the heuristic evaluation
+(Section~\ref{sec:heuristic}), the bandit search
+(Section~\ref{sec:bandit}), and empirical results
+(Section~\ref{sec:benchmarks}).
+
+\section{Rules and Notation}
+\label{sec:rules}
+
+The board is the grid $B=\{0,\dots,19\}^2$. Each player
+$p\in\{0,1,2,3\}$ owns the 21 free polyominoes of sizes 1--5 (89 squares
+total) and a starting corner $c_p$ (one of the four board corners). Players
+move in fixed rotation; a player unable to move is permanently eliminated
+from the rotation (opponent pieces can only remove placement options, never
+create them, so inability to move is absorbing).
+
+A \emph{placement} is a piece, one of its up to eight orientations
+(rotations and reflections, deduplicated per piece), and a translation. Let
+$S\subset B$ be the placement's cells and $O_p$ the cells already occupied by
+$p$. A placement for $p$ is legal iff
+\begin{enumerate}
+  \item $S$ lies within $B$ and is disjoint from \emph{all} occupied cells;
+  \item $S$ is not 4-adjacent (edge-adjacent) to $O_p$;
+  \item $S$ is 8-but-not-4 adjacent (corner-adjacent) to $O_p$; or, if
+        $O_p=\varnothing$, $c_p\in S$.
+\end{enumerate}
+Contact with \emph{other} colors is unrestricted. Terminal scoring is
+official: $-1$ per unplaced square, $+15$ if all 21 pieces were placed, and
+$+5$ more if the monomino was placed last.
+
+\section{Bitboard Engine}
+\label{sec:engine}
+
+\subsection{Representation}
+
+Each player's occupancy $O_p$ is stored as twenty 32-bit words, one per row,
+using the low 20 bits ($\approx$80 bytes per player). The two neighborhood
+operators used throughout are computed by shifts and ORs over rows:
+\begin{align*}
+\mathrm{orth}(X) &= X \cup \{\text{cells 4-adjacent to } X\},\\
+\mathrm{diag}(X) &= \{\text{cells 8-adjacent but not necessarily 4-adjacent to } X\}
+                   \text{ (diagonal spread)}.
+\end{align*}
+Both are 20-iteration loops of word operations; no per-cell work is done.
+
+\subsection{Forbidden cells and seeds}
+
+For player $p$ define
+\begin{align}
+F_p &= \Big(\bigcup_q O_q\Big)\;\cup\;\mathrm{orth}(O_p)
+      &&\text{(\emph{forbidden}: cells no piece of $p$ may cover)},\\
+A_p &= \mathrm{diag}(O_p)\setminus F_p
+      &&\text{(\emph{seeds}: legal anchor cells)},
+\end{align}
+with $A_p=\{c_p\}$ before $p$'s first move. Legality of a placement $S$
+reduces to $S\cap F_p=\varnothing$ and $S\cap A_p\neq\varnothing$: rule (1)
+and (2) are exactly $S \cap F_p = \varnothing$, and rule (3) is
+$S\cap A_p\neq\varnothing$ because any placement satisfying (1)--(2) touches
+$O_p$ diagonally iff it covers a seed.
+
+\subsection{Move generation}
+
+Legal moves are enumerated by aligning, for every unused piece, every
+orientation cell onto every seed and testing the (at most five) cells of the
+placement against $F_p$; duplicates arising from a placement covering several
+seeds are removed with a hash set keyed on (piece, orientation, offset). The
+count of seeds is small (typically 5--30), so enumeration touches only a tiny
+fraction of the $20\times 20\times 8\times 21$ nominal placement space.
+$|A_p|$ (\code{seed\_count}) doubles as a cheap mobility measure for
+evaluation.
+
+\section{Heuristic Policy}
+\label{sec:heuristic}
+
+The fast policy scores every legal move $m$ of player $p$ with
+\begin{equation}
+\label{eq:eval}
+V(m) \;=\; 90\,\mathrm{size}(m)
+      \;+\; 14\,\mathrm{corners}(m)
+      \;+\; 28\,\mathrm{blocked}(m)
+      \;+\; w_c\,\mathrm{center}(m),
+\end{equation}
+where $\mathrm{size}$ is the piece's square count (points saved under
+official scoring); $\mathrm{corners}$ is $|A_p|$ recomputed \emph{after} the
+move (future mobility); $\mathrm{blocked}$ is the number of opponent seed
+cells covered by the move, summed over active opponents (each is one
+placement anchor an opponent loses); and $\mathrm{center}$ sums, over the
+move's cells, $9-d_\infty(\text{cell},\text{center }2\times 2)$, with weight
+$w_c=4$ during the first five rounds and $1$ afterwards. The weights were
+tuned by self-play.
+
+\paragraph{Near-tie sampling.} Instead of a strict $\arg\max$, the policy
+samples uniformly among all moves with
+$V(m)\ge \max_{m'}V(m')-\tau$, $\tau=25$. This costs no measurable strength
+and removes the deterministic ``same opening every game'' artifact (measured
+in Section~\ref{sec:diversity}).
+
+\section{Bandit Search}
+\label{sec:bandit}
+
+The strong policy treats the decision as a \emph{budgeted best-arm
+identification} problem: given a wall-clock budget $T$ (the in-game think
+dial, 0--5\,s), spend rollouts where regret arguments say they are most
+informative, then commit to one move. Algorithm~\ref{alg:bandit} gives the
+full procedure; constants are in Table~\ref{tab:constants}.
+
+\subsection{Arms and priors}
+
+All legal moves are scored with Eq.~\eqref{eq:eval} and the top
+$K=40$ become bandit arms. Arm $i$ with static score $s_i$ is initialized
+with $n_0=2$ virtual visits at value
+\begin{equation}
+\hat v_i^{(0)} = 0.35 + 0.3\,\frac{s_i - s_{\min}}{s_{\max}-s_{\min}} + \varepsilon_i,
+\qquad \varepsilon_i \sim \mathcal{U}(-0.01, 0.01),
+\end{equation}
+so that early pulls follow the heuristic ordering without hard-committing to
+it; the jitter breaks exact ties among symmetric openings.
+
+\subsection{UCB1 allocation}
+
+At iteration $t$ the search pulls the arm maximizing
+\begin{equation}
+\mathrm{UCB}_i \;=\; \hat v_i \;+\; C\,\sqrt{\frac{\ln (t+1)}{n_i+1}},
+\qquad C = 0.45,
+\end{equation}
+where $\hat v_i$ is the arm's running mean value in $[0,1]$ and $n_i$ its
+visit count (including virtual visits). UCB1's logarithmic-regret guarantee
+\cite{auer2002} is what makes the think-time dial behave sensibly: additional
+budget is spent almost exclusively on arms still statistically capable of
+being best.
+
+\subsection{Rollout policy}
+
+A pull of arm $i$ plays $m_i$, then simulates $H=8$ further plies (two full
+rounds) in which \emph{every} player, friend and foe, follows a
+\emph{noisy-greedy} policy: it plays
+$\arg\max_m \big[V(m) + \sigma G_m\big]$ with i.i.d.\ standard Gumbel noise
+$G_m$ and scale $\sigma=25$ evaluation units. By the Gumbel-max
+(perturb-and-max) identity this is exactly softmax sampling over $V/\sigma$
+\cite{gumbel1954,maddison2014}, giving rollouts principled variety at zero
+bookkeeping cost. Plies whose position offers more than 96 legal moves
+evaluate a uniform sample of 96 of them, capping rollout latency around
+1\,ms with no measured strength loss. Eliminated players are skipped by the
+engine's turn logic.
+
+\subsection{Leaf evaluation}
+
+Rollouts are truncated, so leaves are scored by a potential function. For a
+terminal leaf the official score differential against the best opponent is
+used; otherwise
+\begin{equation}
+\phi(q) = \mathrm{placed}(q) + 0.4\,|A_q|, \qquad
+v \;=\; \tfrac12 + \tfrac12\tanh\!\Big(\frac{\phi(p)-\max_{o\neq p,\,o\,\text{active}}\phi(o)}{12}\Big),
+\end{equation}
+i.e., squares already banked plus discounted mobility, squashed to $[0,1]$.
+Measuring against the \emph{best} opponent rather than the average reflects
+that Blokus is won by rank, not by point sum.
+
+\subsection{Final selection}
+
+When the budget expires the search returns the most-visited arm, with one
+refinement: arms whose visit count is within 90\% of the maximum are
+statistically indistinguishable after a few hundred rollouts, so the policy
+picks uniformly among them (exact ties fall back to mean value). This
+preserves strength while keeping openings varied between games.
+
+\begin{algorithm}[t]
+\caption{Budgeted UCB1 move selection for player $p$}
+\label{alg:bandit}
+\begin{algorithmic}[1]
+\State $M \gets$ \code{legal\_moves}$(p)$;\; \Return the move if $|M|\le 1$; greedy policy if $T=0$
+\State score $M$ with Eq.~\eqref{eq:eval}; keep top $K$ as arms with priors $(n_0, \hat v_i^{(0)})$
+\While{elapsed $< T$}
+  \State $i \gets \arg\max_i\ \hat v_i + C\sqrt{\ln(t+1)/(n_i+1)}$
+  \State $G \gets$ copy of root state; play $m_i$
+  \For{$h = 1 \dots H$ while $G$ not terminal}
+    \State current player plays $\arg\max_m V(m) + \sigma\,\mathrm{Gumbel}()$ \Comment{softmax rollout}
+  \EndFor
+  \State update arm $i$ with leaf value $v(G)$;\; $t \gets t+1$
+\EndWhile
+\State \Return uniform choice among arms with $n_i \ge 0.9\max_j n_j$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{table}[t]
+\centering
+\caption{Search constants (all tuned by self-play).}
+\label{tab:constants}
+\begin{tabular}{llr}
+\toprule
+Constant & Meaning & Value \\
+\midrule
+$K$ (\code{TOP\_K}) & candidate arms & 40 \\
+$C$ (\code{UCB\_C}) & UCB1 exploration & 0.45 \\
+$n_0$ (\code{PRIOR\_N}) & virtual prior visits per arm & 2 \\
+$H$ (\code{ROLLOUT\_PLIES}) & rollout horizon (plies) & 8 \\
+$\sigma$ (\code{GUMBEL\_SCALE}) & rollout softmax temperature & 25 \\
+--- (\code{ROLLOUT\_MOVE\_CAP}) & moves evaluated per rollout ply & 96 \\
+$\tau$ (\code{GREEDY\_TOLERANCE}) & greedy near-tie band & 25 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Benchmarks}
+\label{sec:benchmarks}
+
+All measurements: Apple Silicon macOS, \code{cargo run --release} (LTO,
+\code{opt-level=3}), single-threaded search. The benchmark driver is
+\code{examples/selfplay.rs}; the numbers below are from the run recorded at
+the time of writing and are reproduced (within noise) by
+\code{cargo run --release --example selfplay}.
+
+\subsection{Engine and heuristic-policy speed}
+
+Twenty full four-player self-play games with the heuristic policy complete in
+$\approx$0.25\,s total --- $\approx$\textbf{0.19\,ms per move} including full
+legal-move enumeration and evaluation of every candidate. This is the
+latency floor of the ``dial = 0'' setting.
+
+\subsection{Heuristic policy vs.\ random baseline}
+
+Seats 0 and 2 play the heuristic policy; seats 1 and 3 play uniformly random
+legal moves (comparable to v1's opening behavior). Over 20 games the
+heuristic side's best score beats the random side's best score
+\textbf{20/20} times, with mean official scores $-8.7$ vs.\ $-37.3$.
+
+\subsection{Bandit search vs.\ heuristic policy}
+
+Seats 0 and 2 play the bandit search at 300 iterations
+($\approx$350\,ms per decision); seats 1 and 3 play the heuristic policy.
+Over 12 games:
+
+\begin{table}[h]
+\centering
+\caption{Bandit (300 iterations) vs.\ heuristic policy, 12 four-player games.}
+\begin{tabular}{lrr}
+\toprule
+ & Bandit seats & Heuristic seats \\
+\midrule
+Wins (best score in game) & \textbf{11/12} & 1/12 \\
+Mean official score & $-11.6$ & $-20.0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+An 8.4-point mean margin is roughly two pentominoes of extra territory per
+game; in one game the bandit seat placed all 21 pieces ($+20$, the maximum
+score with monomino-last bonus).
+
+\subsection{Budget compliance}
+
+With \code{Budget::Millis(1000)}, decisions from an opening position and a
+round-6 midgame position both returned in 1.001\,s --- the budget is checked
+before every rollout, so the worst-case overshoot is a single rollout
+($\approx$1--5\,ms). At 300 iterations the mean decision time over 430
+decisions was 349\,ms.
+
+\subsection{Opening diversity}
+\label{sec:diversity}
+
+Over ten RNG seeds, the number of distinct first moves played as Blue: v2's
+original strict-argmax greedy \textbf{1/10} (the user-visible ``the first
+pieces are always the same'' defect); near-tie greedy \textbf{8/10}; bandit
+search \textbf{5/10}. The bandit's diversity is lower than the greedy's by
+design --- rollouts genuinely disambiguate some openings the static
+evaluation cannot.
+
+\section{Discussion and Future Work}
+
+The design deliberately spends its budget at the root rather than growing a
+tree: with four players and per-ply branching in the hundreds, a
+UCT tree \cite{browne2012} of meaningful depth is unreachable in a few
+seconds, whereas root-level bandit allocation with strong heuristic rollouts
+converts budget into strength immediately and degrades gracefully to the
+heuristic policy at $T=0$. Natural extensions, roughly in order of expected
+value per effort:
+
+\begin{itemize}
+  \item \textbf{Progressive widening / tree growth} below the root for the
+        late game, where branching collapses and exact lines matter;
+  \item \textbf{Paranoid or max$^n$ backups} in place of the
+        best-opponent potential, sharpening play when one opponent is far
+        ahead;
+  \item \textbf{Learned evaluation} replacing Eq.~\eqref{eq:eval}'s
+        hand-tuned weights (the bitboard features are already
+        network-friendly);
+  \item \textbf{Parallel rollouts} --- the search is single-threaded today;
+        arms are independent given the root, so near-linear speedup is
+        available.
+\end{itemize}
+
+\section{Reproducibility}
+
+\begin{itemize}
+  \item Engine and rules tests: \code{cargo test --release} (12 tests: piece
+        set, legality, scoring, generator/validator consistency, bandit vs.\
+        greedy, budget compliance).
+  \item Benchmarks: \code{cargo run --release --example selfplay}.
+  \item Interactive play: \code{cargo run --release}; the think-time dial on
+        the setup screen sets $T$ per AI move. \code{BLOKUS\_AUTO=<seconds>}
+        launches a four-AI game directly.
+\end{itemize}
+
+\section*{Acknowledgments}
+
+Version 1 was co-authored with ShengHsiung Hsieh. The v2 Rust translation,
+the engine, the search, and this report were produced with Fable~5
+(Claude, Anthropic).
+
+\begin{thebibliography}{9}
+
+\bibitem{auer2002}
+P.~Auer, N.~Cesa-Bianchi, and P.~Fischer.
+\newblock Finite-time analysis of the multiarmed bandit problem.
+\newblock \emph{Machine Learning}, 47(2--3):235--256, 2002.
+
+\bibitem{browne2012}
+C.~Browne et~al.
+\newblock A survey of Monte Carlo tree search methods.
+\newblock \emph{IEEE Transactions on Computational Intelligence and AI in
+  Games}, 4(1):1--43, 2012.
+
+\bibitem{gumbel1954}
+E.~J. Gumbel.
+\newblock \emph{Statistical Theory of Extreme Values and Some Practical
+  Applications}.
+\newblock U.S. National Bureau of Standards, 1954.
+
+\bibitem{maddison2014}
+C.~J. Maddison, D.~Tarlow, and T.~Minka.
+\newblock A$^*$ sampling.
+\newblock In \emph{Advances in Neural Information Processing Systems~27},
+  2014.
+
+\bibitem{blokusrules}
+Mattel, Inc.
+\newblock \emph{Blokus Instruction Sheet R1983}.
+\newblock \url{https://service.mattel.com/instruction_sheets/R1983\%20-\%20Blokus.pdf}
+
+\end{thebibliography}
+
+\end{document}

@@ -1,14 +1,17 @@
 //! Blokus — macroquad UI.
 //!
-//! Setup screen: toggle each seat between Human and AI, then start.
-//! In game: click a piece in the tray to pick it up, R (or right-click)
-//! rotates, F flips, left-click on the board places. AI turns play
-//! automatically; Space pauses, Up/Down changes speed.
+//! Setup screen: toggle each seat between Human and AI, set the AI think-time
+//! dial, then start. In game: click a piece in the tray to pick it up,
+//! R (or right-click) rotates, F flips, left-click on the board places.
+//! AI turns run on a worker thread; Space pauses, Up/Down changes think time.
 
-use blokus::ai::{self, Rng};
-use blokus::game::{GameState, Move, N, PLAYER_NAMES, START_CORNERS};
+use blokus::ai::{self, Budget, Rng};
+use blokus::game::{GameState, Move, N, PLAYER_NAMES, START_CORNERS, TOTAL_SQUARES};
 use blokus::pieces::{NUM_PIECES, flip_horizontal, pieces, rotate_cw};
 use macroquad::prelude::*;
+use std::thread::JoinHandle;
+
+mod memes;
 
 const CELL: f32 = 34.0;
 const BOARD_X: f32 = 30.0;
@@ -18,6 +21,12 @@ const TRAY_Y: f32 = 96.0;
 const TRAY_COL_W: f32 = 96.0;
 const TRAY_ROW_H: f32 = 80.0;
 const SIDE_X: f32 = 1044.0;
+const SIDE_W: f32 = 226.0;
+const CARD_H: f32 = 78.0;
+const CARD_GAP: f32 = 10.0;
+/// Fixed pacing gap between moves so watch mode reads well at 0 think time.
+const PACE_GAP: f32 = 0.25;
+const THINK_MAX: f32 = 5.0;
 
 fn player_color(p: usize) -> Color {
     match p {
@@ -32,6 +41,19 @@ fn dim(c: Color, k: f32) -> Color {
     Color::new(c.r * k, c.g * k, c.b * k, c.a)
 }
 
+fn lighten(c: Color, k: f32) -> Color {
+    Color::new((c.r + k).min(1.0), (c.g + k).min(1.0), (c.b + k).min(1.0), c.a)
+}
+
+/// Cheap deterministic hash noise in [0, 1) from an (index, channel) pair.
+fn hnoise(i: u32, k: u32) -> f32 {
+    let mut v = i.wrapping_mul(2654435761).wrapping_add(k.wrapping_mul(40503)).wrapping_add(0x9e37);
+    v ^= v >> 13;
+    v = v.wrapping_mul(1274126177);
+    v ^= v >> 16;
+    (v & 0xffff) as f32 / 65536.0
+}
+
 enum Screen {
     Setup,
     Playing,
@@ -43,16 +65,46 @@ struct Sel {
     cells: Vec<(i8, i8)>,
 }
 
+/// One firework particle. Sparks fly ballistically and fade out; rockets
+/// (burst != None) ascend and explode into a spray of sparks when their
+/// life runs out.
+struct Particle {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    grav: f32,
+    color: Color,
+    ttl: f32,
+    life: f32,
+    size: f32,
+    burst: Option<(Color, u32)>,
+}
+
 struct App {
     screen: Screen,
     is_ai: [bool; 4],
     gs: GameState,
     sel: Option<Sel>,
     rng: Rng,
-    ai_timer: f32,
-    ai_delay: f32,
+    /// How long the AI may think per move, in seconds (0 = instant greedy).
+    think_time: f32,
+    /// Worker thread computing the current AI move (never on render thread).
+    ai_handle: Option<JoinHandle<Option<Move>>>,
+    /// Wall-clock time the current AI search started (for the progress bar).
+    ai_started: f64,
+    /// Time since the last move; the next AI move waits for PACE_GAP.
+    pace: f32,
     paused: bool,
+    drag_slider: bool,
     toasts: Vec<(String, f32)>,
+    particles: Vec<Particle>,
+    /// Countdown to the next celebration rocket on the game-over screen.
+    fw_timer: f32,
+    winner: usize,
+    meme_text: String,
+    /// Countdown until the next meme rotates in.
+    meme_timer: f32,
 }
 
 impl App {
@@ -63,11 +115,24 @@ impl App {
             gs: GameState::new(),
             sel: None,
             rng: Rng(macroquad::miniquad::date::now().to_bits() | 1),
-            ai_timer: 0.0,
-            ai_delay: 0.45,
+            think_time: 1.5,
+            ai_handle: None,
+            ai_started: 0.0,
+            pace: 0.0,
             paused: false,
+            drag_slider: false,
             toasts: Vec::new(),
+            particles: Vec::new(),
+            fw_timer: 0.0,
+            winner: 0,
+            meme_text: String::new(),
+            meme_timer: 4.0,
         }
+    }
+
+    /// Uniform random float in [0, 1).
+    fn rf(&mut self) -> f32 {
+        (self.rng.next() >> 40) as f32 / 16_777_216.0
     }
 
     fn toast(&mut self, msg: String) {
@@ -78,20 +143,214 @@ impl App {
         self.gs = GameState::new();
         self.sel = None;
         self.paused = false;
-        self.ai_timer = 0.0;
+        self.pace = 0.0;
+        self.ai_handle = None; // detach any stale worker; its result is ignored
         self.toasts.clear();
+        self.particles.clear();
         self.screen = Screen::Playing;
     }
 
     fn finish_move(&mut self) {
         self.sel = None;
-        self.ai_timer = 0.0;
+        self.pace = 0.0;
         for p in self.gs.advance_turn() {
             self.toast(format!("{} is out of moves", PLAYER_NAMES[p]));
         }
         if self.gs.is_over() {
+            let mut ranked: Vec<usize> = (0..4).collect();
+            ranked.sort_by_key(|&p| -self.gs.score(p));
+            self.winner = ranked[0];
+            self.pick_meme();
+            self.fw_timer = 0.0;
             self.screen = Screen::GameOver;
         }
+    }
+
+    fn pick_meme(&mut self) {
+        let raw = memes::pick(self.rng.next());
+        self.meme_text = raw.replace("{winner}", PLAYER_NAMES[self.winner]);
+        self.meme_timer = 4.0;
+    }
+
+    // -- Fireworks particle system ---------------------------------------
+
+    fn spawn_burst(&mut self, x: f32, y: f32, color: Color, n: u32) {
+        for _ in 0..n {
+            let ang = self.rf() * std::f32::consts::TAU;
+            let speed = 30.0 + self.rf().sqrt() * 230.0;
+            let ttl = 0.8 + self.rf() * 1.0;
+            let c = if self.rf() < 0.28 { WHITE } else { color };
+            let grav = 110.0 + self.rf() * 60.0;
+            let size = 1.9 + self.rf() * 2.4;
+            self.particles.push(Particle {
+                x,
+                y,
+                vx: ang.cos() * speed,
+                vy: ang.sin() * speed - 25.0,
+                grav,
+                color: c,
+                ttl,
+                life: ttl,
+                size,
+                burst: None,
+            });
+        }
+        self.trim_particles();
+    }
+
+    fn launch_rocket(&mut self, x: f32, y: f32, color: Color, sparks: u32) {
+        let ttl = 0.55 + self.rf() * 0.5;
+        let vx = self.rf() * 90.0 - 45.0;
+        let vy = -(330.0 + self.rf() * 260.0);
+        self.particles.push(Particle {
+            x,
+            y,
+            vx,
+            vy,
+            grav: 120.0,
+            color: WHITE,
+            ttl,
+            life: ttl,
+            size: 2.4,
+            burst: Some((color, sparks)),
+        });
+        self.trim_particles();
+    }
+
+    fn trim_particles(&mut self) {
+        let len = self.particles.len();
+        if len > 4000 {
+            self.particles.drain(0..len - 4000);
+        }
+    }
+
+    fn update_particles(&mut self) {
+        if self.particles.is_empty() {
+            return;
+        }
+        let dt = get_frame_time().min(0.05);
+        let mut bursts: Vec<(f32, f32, Color, u32)> = Vec::new();
+        for p in &mut self.particles {
+            p.life -= dt;
+            p.vy += p.grav * dt;
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+            if p.life <= 0.0 {
+                if let Some((c, n)) = p.burst {
+                    bursts.push((p.x, p.y, c, n));
+                }
+            }
+        }
+        self.particles.retain(|p| p.life > 0.0);
+        for (x, y, c, n) in bursts {
+            self.spawn_burst(x, y, c, n);
+        }
+    }
+
+    /// Fireworks scaled to how many opponent corners this move just blocked,
+    /// bursting at the blocked cells in the blocking player's color.
+    fn celebrate_block(&mut self, p: usize, cells: &[(i32, i32)]) {
+        let b = cells.len();
+        if b == 0 {
+            return;
+        }
+        let per: u32 = match b {
+            1..=2 => 26,
+            3..=4 => 42,
+            _ => 55,
+        };
+        let color = player_color(p);
+        for &(r, c) in cells {
+            let (x, y) = cell_xy(r, c);
+            self.spawn_burst(x + CELL / 2.0, y + CELL / 2.0, color, per);
+        }
+        if b >= 3 {
+            self.toast(format!("{} blocked {b} corners!", PLAYER_NAMES[p]));
+        }
+        if b >= 5 {
+            // Crazy volley: rockets fired up from below the board.
+            let side = N as f32 * CELL;
+            for _ in 0..4 {
+                let x = BOARD_X + self.rf() * side;
+                self.launch_rocket(x, BOARD_Y + side + 10.0, color, 60);
+            }
+        }
+    }
+}
+
+/// Opponent anchor cells (seeds) that move `mv` of player `p` would cover,
+/// summed over still-active opponents (a cell seeding two opponents counts
+/// twice). Call BEFORE `gs.apply`.
+fn blocked_corner_cells(gs: &GameState, p: usize, mv: &Move) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    for o in 0..4 {
+        if o == p || !gs.active[o] {
+            continue;
+        }
+        let seeds = gs.seeds(o);
+        for (r, c) in mv.cells() {
+            if (0..N as i32).contains(&r) && (0..N as i32).contains(&c) && seeds[r as usize] >> c & 1 == 1 {
+                out.push((r, c));
+            }
+        }
+    }
+    out
+}
+
+fn draw_particles(app: &App) {
+    for p in &app.particles {
+        let a = (p.life / p.ttl).clamp(0.0, 1.0);
+        if p.burst.is_some() {
+            // Rocket: bright head with a short streak behind it.
+            draw_line(p.x, p.y, p.x - p.vx * 0.045, p.y - p.vy * 0.045, 2.0, Color::new(1.0, 0.95, 0.75, 0.35 + 0.5 * a));
+            draw_circle(p.x, p.y, p.size, Color::new(1.0, 1.0, 1.0, 0.95));
+        } else {
+            draw_circle(p.x, p.y, p.size * 2.2, Color { a: 0.3 * a, ..p.color });
+            draw_circle(p.x, p.y, p.size * (0.4 + 0.6 * a), Color { a: (a * 1.7).min(1.0), ..p.color });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared drawing helpers
+// ---------------------------------------------------------------------------
+
+/// A physical-looking game block filling an s x s box: drop shadow, body,
+/// light top/left bevel, dark bottom edge, shaded inner plateau.
+fn draw_block(x: f32, y: f32, s: f32, color: Color) {
+    let p = (s * 0.05).max(1.0);
+    let w = s - 2.0 * p;
+    let edge = (s * 0.12).max(2.0);
+    draw_rectangle(x + p + s * 0.09, y + p + s * 0.11, w, w, Color::new(0.0, 0.0, 0.0, 0.35));
+    draw_rectangle(x + p, y + p, w, w, color);
+    draw_rectangle(x + p, y + p, w, edge, Color { a: 0.85, ..lighten(color, 0.22) });
+    draw_rectangle(x + p, y + p, (s * 0.1).max(2.0), w, Color { a: 0.5, ..lighten(color, 0.14) });
+    draw_rectangle(x + p, y + p + w - edge, w, edge, Color { a: 0.75, ..dim(color, 0.6) });
+    draw_rectangle(x + s * 0.26, y + s * 0.26, s * 0.48, s * 0.48, dim(color, 0.86));
+}
+
+/// Slow drifting translucent squares behind everything.
+fn draw_ambient() {
+    let t = get_time() as f32;
+    let sw = screen_width();
+    let sh = screen_height();
+    for i in 0..18u32 {
+        let size = 50.0 + hnoise(i, 0) * 150.0;
+        let x = (hnoise(i, 1) * sw + t * (4.0 + hnoise(i, 2) * 11.0)) % (sw + size) - size;
+        let y = (hnoise(i, 3) * sh + t * (2.0 + hnoise(i, 4) * 7.0)) % (sh + size) - size;
+        let rot = (t * (2.0 + hnoise(i, 5) * 5.0) + hnoise(i, 6) * 360.0).to_radians();
+        let c = player_color((i % 4) as usize);
+        draw_rectangle_ex(
+            x,
+            y,
+            size,
+            size,
+            DrawRectangleParams {
+                rotation: rot,
+                color: Color { a: 0.045 + hnoise(i, 7) * 0.035, ..c },
+                ..Default::default()
+            },
+        );
     }
 }
 
@@ -99,17 +358,30 @@ fn button(x: f32, y: f32, w: f32, h: f32, label: &str, active: bool) -> bool {
     let (mx, my) = mouse_position();
     let hover = mx >= x && mx <= x + w && my >= y && my <= y + h;
     let bg = if active {
-        if hover { Color::from_rgba(90, 105, 140, 255) } else { Color::from_rgba(70, 82, 110, 255) }
+        if hover { Color::from_rgba(96, 112, 152, 255) } else { Color::from_rgba(74, 88, 122, 255) }
+    } else if hover {
+        Color::from_rgba(58, 63, 80, 255)
     } else {
-        Color::from_rgba(48, 52, 64, 255)
+        Color::from_rgba(46, 50, 63, 255)
     };
+    draw_rectangle(x + 2.0, y + 3.0, w, h, Color::new(0.0, 0.0, 0.0, 0.3));
     draw_rectangle(x, y, w, h, bg);
-    draw_rectangle_lines(x, y, w, h, 2.0, Color::from_rgba(130, 140, 165, 255));
+    draw_rectangle(x, y, w, 3.0, Color::new(1.0, 1.0, 1.0, if active { 0.25 } else { 0.1 }));
+    let border = if active {
+        Color::from_rgba(170, 190, 230, 255)
+    } else {
+        Color::from_rgba(110, 118, 140, 255)
+    };
+    draw_rectangle_lines(x, y, w, h, 2.0, border);
     let size = 24.0;
     let dims = measure_text(label, None, size as u16, 1.0);
     draw_text(label, x + (w - dims.width) / 2.0, y + h / 2.0 + dims.height / 2.0 - 2.0, size, WHITE);
     hover && is_mouse_button_pressed(MouseButton::Left)
 }
+
+// ---------------------------------------------------------------------------
+// Board
+// ---------------------------------------------------------------------------
 
 fn board_cell_at(mx: f32, my: f32) -> Option<(i32, i32)> {
     let c = ((mx - BOARD_X) / CELL).floor() as i32;
@@ -117,71 +389,109 @@ fn board_cell_at(mx: f32, my: f32) -> Option<(i32, i32)> {
     if r >= 0 && c >= 0 && r < N as i32 && c < N as i32 { Some((r, c)) } else { None }
 }
 
-fn draw_cell(r: i32, c: i32, color: Color) {
-    let x = BOARD_X + c as f32 * CELL;
-    let y = BOARD_Y + r as f32 * CELL;
-    draw_rectangle(x + 1.0, y + 1.0, CELL - 2.0, CELL - 2.0, color);
-    draw_rectangle(x + 4.0, y + 4.0, CELL - 8.0, CELL - 8.0, dim(color, 0.82));
+fn cell_xy(r: i32, c: i32) -> (f32, f32) {
+    (BOARD_X + c as f32 * CELL, BOARD_Y + r as f32 * CELL)
 }
 
 fn draw_board(app: &App) {
-    draw_rectangle(BOARD_X - 6.0, BOARD_Y - 6.0, N as f32 * CELL + 12.0, N as f32 * CELL + 12.0, Color::from_rgba(20, 22, 28, 255));
+    let t = get_time() as f32;
+    let side = N as f32 * CELL;
+    // Frame with a soft glow in the current player's color.
+    let glow = Color { a: 0.20 + 0.10 * (t * 2.0).sin(), ..player_color(app.gs.current) };
+    for i in 0..3 {
+        let k = 8.0 + i as f32 * 4.0;
+        draw_rectangle_lines(BOARD_X - k, BOARD_Y - k, side + 2.0 * k, side + 2.0 * k, 2.0, Color { a: glow.a * (1.0 - i as f32 * 0.3), ..glow });
+    }
+    draw_rectangle(BOARD_X - 7.0, BOARD_Y - 7.0, side + 14.0, side + 14.0, Color::from_rgba(16, 18, 24, 255));
+    // Checkered empty cells.
     for r in 0..N {
         for c in 0..N {
-            let x = BOARD_X + c as f32 * CELL;
-            let y = BOARD_Y + r as f32 * CELL;
-            draw_rectangle(x + 1.0, y + 1.0, CELL - 2.0, CELL - 2.0, Color::from_rgba(44, 48, 60, 255));
+            let (x, y) = cell_xy(r as i32, c as i32);
+            let base = if (r + c) % 2 == 0 {
+                Color::from_rgba(43, 47, 59, 255)
+            } else {
+                Color::from_rgba(38, 42, 53, 255)
+            };
+            draw_rectangle(x + 1.0, y + 1.0, CELL - 2.0, CELL - 2.0, base);
         }
     }
+    // Placed pieces as physical blocks.
     for p in 0..4 {
         for r in 0..N {
             for c in 0..N {
                 if app.gs.occ[p][r] >> c & 1 == 1 {
-                    draw_cell(r as i32, c as i32, player_color(p));
+                    let (x, y) = cell_xy(r as i32, c as i32);
+                    draw_block(x, y, CELL, player_color(p));
                 }
             }
         }
         // Starting-corner marker until the player has placed something.
         if app.gs.is_first_move(p) && app.gs.active[p] {
             let (r, c) = START_CORNERS[p];
-            let x = BOARD_X + c as f32 * CELL + CELL / 2.0;
-            let y = BOARD_Y + r as f32 * CELL + CELL / 2.0;
-            draw_poly(x, y, 4, CELL * 0.28, 45.0, player_color(p));
+            let (x, y) = cell_xy(r as i32, c as i32);
+            let pulse = 0.24 + 0.06 * (t * 3.0).sin();
+            draw_poly(x + CELL / 2.0, y + CELL / 2.0, 4, CELL * pulse, 45.0, player_color(p));
         }
     }
-    // Outline the most recent placement.
+    // Anchor hints: on a human's turn, pulse the seed cells they can grow from.
+    let cur = app.gs.current;
+    if matches!(app.screen, Screen::Playing) && !app.is_ai[cur] && app.gs.active[cur] {
+        let seeds = app.gs.seeds(cur);
+        let col = player_color(cur);
+        for r in 0..N {
+            for c in 0..N {
+                if seeds[r] >> c & 1 == 1 {
+                    let (x, y) = cell_xy(r as i32, c as i32);
+                    let ph = t * 4.0 + (r + c) as f32 * 0.55;
+                    let rad = 4.2 + 1.6 * ph.sin();
+                    draw_circle(x + CELL / 2.0, y + CELL / 2.0, rad + 2.5, Color { a: 0.18, ..col });
+                    draw_circle(x + CELL / 2.0, y + CELL / 2.0, rad, Color { a: 0.55 + 0.25 * ph.sin(), ..col });
+                }
+            }
+        }
+    }
+    // Pulsing outline on the most recent placement.
     let last_player = (app.gs.current + 3) % 4;
     if let Some(mv) = &app.gs.last_move[last_player] {
+        let a = 0.55 + 0.4 * (t * 4.5).sin();
         for (r, c) in mv.cells() {
-            let x = BOARD_X + c as f32 * CELL;
-            let y = BOARD_Y + r as f32 * CELL;
-            draw_rectangle_lines(x + 1.0, y + 1.0, CELL - 2.0, CELL - 2.0, 3.0, WHITE);
+            let (x, y) = cell_xy(r, c);
+            draw_rectangle_lines(x + 1.0, y + 1.0, CELL - 2.0, CELL - 2.0, 3.0, Color::new(1.0, 1.0, 1.0, a));
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tray
+// ---------------------------------------------------------------------------
 
 /// Piece thumbnail centered in a box; returns true if clicked.
 fn draw_piece_thumb(piece: usize, x: f32, y: f32, w: f32, h: f32, color: Color, enabled: bool, selected: bool) -> bool {
     let (mx, my) = mouse_position();
     let hover = mx >= x && mx <= x + w && my >= y && my <= y + h;
     let bg = if selected {
-        Color::from_rgba(90, 100, 130, 255)
+        Color::from_rgba(74, 84, 116, 255)
     } else if hover && enabled {
-        Color::from_rgba(62, 68, 86, 255)
+        Color::from_rgba(58, 64, 84, 255)
     } else {
-        Color::from_rgba(40, 44, 56, 255)
+        Color::from_rgba(37, 41, 53, 255)
     };
     draw_rectangle(x, y, w, h, bg);
-    draw_rectangle_lines(x, y, w, h, 1.0, Color::from_rgba(90, 96, 116, 255));
+    if selected {
+        let a = 0.6 + 0.3 * (get_time() as f32 * 5.0).sin();
+        draw_rectangle_lines(x, y, w, h, 3.0, Color { a, ..color });
+    } else {
+        draw_rectangle_lines(x, y, w, h, 1.0, Color::from_rgba(82, 88, 108, 255));
+    }
     let cells = &pieces()[piece].orientations[0];
     let max_r = cells.iter().map(|c| c.0).max().unwrap() as f32 + 1.0;
     let max_c = cells.iter().map(|c| c.1).max().unwrap() as f32 + 1.0;
     let s = 13.0;
     let ox = x + (w - max_c * s) / 2.0;
     let oy = y + (h - max_r * s) / 2.0;
-    let col = if enabled { color } else { dim(color, 0.3) };
+    let col = if enabled { color } else { dim(color, 0.28) };
     for &(r, c) in cells {
-        draw_rectangle(ox + c as f32 * s + 1.0, oy + r as f32 * s + 1.0, s - 2.0, s - 2.0, col);
+        draw_block(ox + c as f32 * s, oy + r as f32 * s, s, col);
     }
     enabled && hover && is_mouse_button_pressed(MouseButton::Left)
 }
@@ -189,13 +499,10 @@ fn draw_piece_thumb(piece: usize, x: f32, y: f32, w: f32, h: f32, color: Color, 
 fn draw_tray(app: &mut App) {
     let p = app.gs.current;
     let human_turn = !app.is_ai[p] && app.gs.active[p];
-    draw_text(
-        &format!("{}'s pieces", PLAYER_NAMES[p]),
-        TRAY_X,
-        TRAY_Y - 14.0,
-        26.0,
-        player_color(p),
-    );
+    // Panel backdrop.
+    draw_rectangle(TRAY_X - 12.0, TRAY_Y - 46.0, 3.0 * TRAY_COL_W + 16.0, 7.0 * TRAY_ROW_H + 52.0, Color::new(0.06, 0.07, 0.1, 0.55));
+    draw_rectangle(TRAY_X - 12.0, TRAY_Y - 46.0, 3.0 * TRAY_COL_W + 16.0, 3.0, Color { a: 0.7, ..player_color(p) });
+    draw_text(&format!("{}'s pieces", PLAYER_NAMES[p]), TRAY_X, TRAY_Y - 18.0, 26.0, player_color(p));
     let mut clicked: Option<usize> = None;
     for piece in 0..NUM_PIECES {
         let col = piece % 3;
@@ -217,30 +524,54 @@ fn draw_tray(app: &mut App) {
     }
 }
 
-fn draw_side_panel(app: &App) {
+// ---------------------------------------------------------------------------
+// Player cards + side panel
+// ---------------------------------------------------------------------------
+
+fn draw_player_cards(app: &App) {
+    let t = get_time() as f32;
+    let x = SIDE_X;
+    draw_text("Players", x, TRAY_Y - 18.0, 26.0, LIGHTGRAY);
     let mut y = TRAY_Y;
-    draw_text("Players", SIDE_X, y - 14.0, 26.0, LIGHTGRAY);
     for p in 0..4 {
         let c = player_color(p);
-        draw_rectangle(SIDE_X, y, 20.0, 20.0, c);
-        let marker = if p == app.gs.current && matches!(app.screen, Screen::Playing) { ">" } else { " " };
-        let status = if app.gs.active[p] {
-            format!("x{}", app.gs.pieces_left[p].count_ones())
+        let out = !app.gs.active[p];
+        let current = p == app.gs.current && matches!(app.screen, Screen::Playing);
+        let bg = if current {
+            Color::from_rgba(50, 56, 76, 255)
         } else {
-            "out".to_string()
+            Color::from_rgba(34, 38, 49, 255)
         };
-        let ai = if app.is_ai[p] { "AI" } else { "You" };
-        draw_text(
-            &format!("{marker} {} ({ai}) {} {status}", PLAYER_NAMES[p], app.gs.score(p)),
-            SIDE_X + 28.0,
-            y + 16.0,
-            20.0,
-            if app.gs.active[p] { WHITE } else { GRAY },
-        );
-        y += 34.0;
+        draw_rectangle(x + 2.0, y + 3.0, SIDE_W, CARD_H, Color::new(0.0, 0.0, 0.0, 0.3));
+        draw_rectangle(x, y, SIDE_W, CARD_H, if out { dim(bg, 0.75) } else { bg });
+        // Accent bar.
+        draw_rectangle(x, y, 5.0, CARD_H, if out { dim(c, 0.35) } else { c });
+        if current {
+            let a = 0.55 + 0.35 * (t * 3.2).sin();
+            draw_rectangle_lines(x, y, SIDE_W, CARD_H, 2.0, Color { a, ..c });
+        }
+        let ink = if out { 0.4 } else { 1.0 };
+        // Name + seat tag.
+        draw_text(PLAYER_NAMES[p], x + 16.0, y + 26.0, 24.0, Color { a: ink, ..if out { GRAY } else { c } });
+        let tag = if out { "OUT" } else if app.is_ai[p] { "AI" } else { "HUMAN" };
+        let td = measure_text(tag, None, 16, 1.0);
+        draw_text(tag, x + SIDE_W - 12.0 - td.width, y + 24.0, 16.0, Color::new(0.62, 0.66, 0.76, ink));
+        // Score (live) + pieces left.
+        let score = format!("{:+}", app.gs.score(p));
+        let sd = measure_text(&score, None, 30, 1.0);
+        draw_text(&score, x + SIDE_W - 12.0 - sd.width, y + 54.0, 30.0, Color::new(1.0, 1.0, 1.0, ink));
+        let left = app.gs.pieces_left[p].count_ones();
+        draw_text(&format!("{left} pieces left"), x + 16.0, y + 50.0, 17.0, Color::new(0.62, 0.66, 0.76, ink));
+        // Progress: squares placed out of 89.
+        let placed = (TOTAL_SQUARES - app.gs.squares_remaining(p)) as f32 / TOTAL_SQUARES as f32;
+        let bw = SIDE_W - 28.0;
+        draw_rectangle(x + 16.0, y + CARD_H - 16.0, bw, 6.0, Color::from_rgba(20, 22, 29, 255));
+        draw_rectangle(x + 16.0, y + CARD_H - 16.0, bw * placed, 6.0, Color { a: 0.55 + 0.45 * ink, ..c });
+        y += CARD_H + CARD_GAP;
     }
-    y += 30.0;
-    draw_text("Controls", SIDE_X, y, 24.0, LIGHTGRAY);
+    // Controls.
+    y += 22.0;
+    draw_text("Controls", x, y, 24.0, LIGHTGRAY);
     y += 26.0;
     let lines: [&str; 6] = [
         "Click piece, then board",
@@ -248,16 +579,23 @@ fn draw_side_panel(app: &App) {
         "F: flip",
         "Esc: put piece back",
         "Space: pause AI",
-        "Up/Down: AI speed",
+        "Up/Down: AI think time",
     ];
     for l in lines {
-        draw_text(l, SIDE_X, y, 19.0, GRAY);
+        draw_text(l, x, y, 19.0, GRAY);
         y += 22.0;
     }
-    y += 16.0;
-    let speed = if app.paused { "paused".to_string() } else { format!("{:.2}s / move", app.ai_delay) };
-    draw_text(&format!("AI speed: {speed}"), SIDE_X, y, 20.0, LIGHTGRAY);
+    y += 18.0;
+    let think = if app.think_time <= 0.0 { "instant".to_string() } else { format!("{:.1}s / move", app.think_time) };
+    draw_text(&format!("AI think time: {think}"), x, y, 20.0, LIGHTGRAY);
+    if app.paused {
+        draw_text("PAUSED", x, y + 24.0, 20.0, GOLD);
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Ghost preview
+// ---------------------------------------------------------------------------
 
 fn draw_ghost(app: &App) -> Option<(Move, bool)> {
     let sel = app.sel.as_ref()?;
@@ -269,21 +607,25 @@ fn draw_ghost(app: &App) -> Option<(Move, bool)> {
     let orient = pieces()[sel.piece].orientations.iter().position(|o| *o == sel.cells)?;
     let mv = Move { piece: sel.piece, orient, row, col };
     let legal = app.gs.move_is_legal(app.gs.current, &mv);
+    let pulse = 0.65 + 0.25 * (get_time() as f32 * 6.0).sin();
     let outline = if legal {
-        Color::new(1.0, 1.0, 1.0, 0.85)
+        Color::new(1.0, 1.0, 1.0, pulse)
     } else {
         Color::new(1.0, 0.25, 0.25, 0.6)
     };
     for (rr, cc) in mv.cells() {
         if (0..N as i32).contains(&rr) && (0..N as i32).contains(&cc) {
-            let x = BOARD_X + cc as f32 * CELL;
-            let y = BOARD_Y + rr as f32 * CELL;
+            let (x, y) = cell_xy(rr, cc);
             draw_rectangle(x + 1.0, y + 1.0, CELL - 2.0, CELL - 2.0, Color { a: 0.45, ..player_color(app.gs.current) });
             draw_rectangle_lines(x + 1.0, y + 1.0, CELL - 2.0, CELL - 2.0, 2.0, outline);
         }
     }
     Some((mv, legal))
 }
+
+// ---------------------------------------------------------------------------
+// Game loop: update + draw
+// ---------------------------------------------------------------------------
 
 fn update_playing(app: &mut App) {
     let p = app.gs.current;
@@ -293,26 +635,42 @@ fn update_playing(app: &mut App) {
         app.paused = !app.paused;
     }
     if is_key_pressed(KeyCode::Up) {
-        app.ai_delay = (app.ai_delay - 0.15).max(0.0);
+        app.think_time = (app.think_time + 0.5).min(THINK_MAX);
     }
     if is_key_pressed(KeyCode::Down) {
-        app.ai_delay = (app.ai_delay + 0.15).min(1.5);
+        app.think_time = (app.think_time - 0.5).max(0.0);
     }
 
     if app.is_ai[p] {
-        if !app.paused {
-            app.ai_timer += get_frame_time();
-            if app.ai_timer >= app.ai_delay {
-                match ai::choose_move(&app.gs, p, &mut app.rng) {
+        if app.ai_handle.is_some() {
+            // Poll the worker; join only once finished so the UI never blocks.
+            if app.ai_handle.as_ref().is_some_and(|h| h.is_finished()) && !app.paused {
+                let mv = app.ai_handle.take().unwrap().join().unwrap_or(None);
+                match mv {
                     Some(mv) => {
+                        let blocked = blocked_corner_cells(&app.gs, p, &mv);
                         app.gs.apply(p, &mv);
-                        app.finish_move();
+                        app.celebrate_block(p, &blocked);
                     }
-                    None => {
-                        app.gs.active[p] = false;
-                        app.finish_move();
-                    }
+                    None => app.gs.active[p] = false,
                 }
+                app.finish_move();
+            }
+        } else if !app.paused {
+            app.pace += get_frame_time();
+            if app.pace >= PACE_GAP {
+                let gs = app.gs.clone();
+                let seed = app.rng.next() | 1;
+                let think = app.think_time;
+                app.ai_started = get_time();
+                app.ai_handle = Some(std::thread::spawn(move || {
+                    let mut rng = Rng(seed);
+                    if think <= 0.0 {
+                        ai::choose_move(&gs, p, &mut rng)
+                    } else {
+                        ai::choose_move_strong(&gs, p, Budget::Millis((think * 1000.0) as u64), &mut rng)
+                    }
+                }));
             }
         }
         return;
@@ -332,28 +690,65 @@ fn update_playing(app: &mut App) {
     }
 }
 
-fn draw_playing(app: &mut App) {
-    draw_text("BLOKUS", BOARD_X, 46.0, 44.0, WHITE);
+fn draw_header(app: &App) {
+    let t = get_time() as f32;
+    draw_text("BLOKUS", BOARD_X, 42.0, 42.0, WHITE);
+    let lw = measure_text("BLOKUS", None, 42, 1.0).width;
+    let seg = lw / 4.0;
+    for i in 0..4 {
+        draw_rectangle(BOARD_X + i as f32 * seg, 48.0, seg - 3.0, 5.0, player_color(i));
+    }
     let p = app.gs.current;
-    let turn_label = if app.is_ai[p] {
-        format!("{} (AI) is thinking...", PLAYER_NAMES[p])
-    } else {
-        format!("Your turn, {}", PLAYER_NAMES[p])
-    };
-    draw_text(&turn_label, BOARD_X + 230.0, 46.0, 28.0, player_color(p));
+    if matches!(app.screen, Screen::Playing) {
+        if app.is_ai[p] {
+            let dots = ".".repeat(1 + ((t * 2.5) as usize) % 3);
+            let label = if app.paused {
+                format!("{} (AI) — paused", PLAYER_NAMES[p])
+            } else {
+                format!("{} (AI) is thinking{dots}", PLAYER_NAMES[p])
+            };
+            draw_text(&label, BOARD_X + 240.0, 42.0, 28.0, player_color(p));
+            // Thin progress bar: elapsed vs think budget.
+            if app.ai_handle.is_some() && app.think_time > 0.0 && !app.paused {
+                let frac = (((get_time() - app.ai_started) as f32) / app.think_time).clamp(0.0, 1.0);
+                let bw = N as f32 * CELL;
+                draw_rectangle(BOARD_X, 58.0, bw, 4.0, Color::from_rgba(18, 20, 26, 255));
+                draw_rectangle(BOARD_X, 58.0, bw * frac, 4.0, Color { a: 0.9, ..player_color(p) });
+            }
+        } else {
+            draw_text(&format!("Your turn, {}", PLAYER_NAMES[p]), BOARD_X + 240.0, 42.0, 28.0, player_color(p));
+        }
+    }
+}
 
+fn draw_playing(app: &mut App) {
+    draw_header(app);
     draw_board(app);
     draw_tray(app);
-    draw_side_panel(app);
+    draw_player_cards(app);
 
+    let p = app.gs.current;
     // Ghost + placement for the human player.
     if !app.is_ai[p] {
         if let Some((mv, legal)) = draw_ghost(app) {
             if legal && is_mouse_button_pressed(MouseButton::Left) {
+                let blocked = blocked_corner_cells(&app.gs, p, &mv);
                 app.gs.apply(p, &mv);
+                app.celebrate_block(p, &blocked);
                 app.finish_move();
             }
         }
+    }
+
+    draw_particles(app);
+
+    if app.paused {
+        let msg = "PAUSED — Space to resume";
+        let d = measure_text(msg, None, 30, 1.0);
+        let cx = BOARD_X + (N as f32 * CELL - d.width) / 2.0;
+        let cy = BOARD_Y + N as f32 * CELL / 2.0;
+        draw_rectangle(cx - 18.0, cy - 32.0, d.width + 36.0, 48.0, Color::new(0.0, 0.0, 0.0, 0.7));
+        draw_text(msg, cx, cy, 30.0, GOLD);
     }
 
     // Toasts.
@@ -371,52 +766,230 @@ fn draw_playing(app: &mut App) {
     app.toasts.retain(|(_, ttl)| *ttl > 0.0);
 }
 
+// ---------------------------------------------------------------------------
+// Setup screen
+// ---------------------------------------------------------------------------
+
+/// 5-row bitmap of "BLOKUS": six 4-wide letters separated by one-column gaps.
+const LOGO_ROWS: [&str; 5] = [
+    "###. #... .##. #..# #..# .###",
+    "#..# #... #..# #.#. #..# #...",
+    "###. #... #..# ##.. #..# .##.",
+    "#..# #... #..# #.#. #..# ...#",
+    "###. #### .##. #..# .##. ###.",
+];
+
+fn draw_logo(cx: f32, top: f32, s: f32) {
+    let cols = LOGO_ROWS[0].len() as f32;
+    let x0 = cx - cols * s / 2.0;
+    let t = get_time() as f32;
+    for (r, row) in LOGO_ROWS.iter().enumerate() {
+        for (c, ch) in row.bytes().enumerate() {
+            if ch == b'#' {
+                let letter = c / 5;
+                let bob = (t * 1.8 + letter as f32 * 0.7).sin() * 3.0;
+                draw_block(x0 + c as f32 * s, top + r as f32 * s + bob, s, player_color(letter % 4));
+            }
+        }
+    }
+}
+
+fn draw_think_slider(app: &mut App, x: f32, y: f32, w: f32) {
+    let (mx, my) = mouse_position();
+    let hot = mx >= x - 14.0 && mx <= x + w + 14.0 && (my - y).abs() <= 16.0;
+    if hot && is_mouse_button_pressed(MouseButton::Left) {
+        app.drag_slider = true;
+    }
+    if !is_mouse_button_down(MouseButton::Left) {
+        app.drag_slider = false;
+    }
+    if app.drag_slider {
+        let v = ((mx - x) / w * THINK_MAX).clamp(0.0, THINK_MAX);
+        app.think_time = (v * 2.0).round() / 2.0; // snap to 0.5 s steps
+    }
+    let frac = app.think_time / THINK_MAX;
+    // Track, fill, ticks, knob.
+    draw_rectangle(x, y - 3.0, w, 6.0, Color::from_rgba(24, 27, 35, 255));
+    draw_rectangle(x, y - 3.0, frac * w, 6.0, Color::from_rgba(96, 165, 250, 255));
+    for i in 0..=10 {
+        let tx = x + i as f32 / 10.0 * w;
+        draw_rectangle(tx - 1.0, y + 6.0, 2.0, 5.0, Color::from_rgba(96, 104, 126, 255));
+    }
+    let kx = x + frac * w;
+    draw_circle(kx, y, 12.0, Color::new(0.0, 0.0, 0.0, 0.4));
+    draw_circle(kx, y, 11.0, Color::from_rgba(226, 232, 240, 255));
+    draw_circle(kx, y, 6.5, Color::from_rgba(59, 130, 246, 255));
+    draw_text("0 (instant)", x - 8.0, y + 30.0, 17.0, GRAY);
+    let d = measure_text("5.0 s", None, 17, 1.0);
+    draw_text("5.0 s", x + w - d.width + 8.0, y + 30.0, 17.0, GRAY);
+}
+
 fn draw_setup(app: &mut App) {
     let cx = screen_width() / 2.0;
-    let title = "BLOKUS";
-    let dims = measure_text(title, None, 80, 1.0);
-    draw_text(title, cx - dims.width / 2.0, 130.0, 80.0, WHITE);
-    let sub = "official 20 x 20 board - Rust edition";
-    let d2 = measure_text(sub, None, 24, 1.0);
-    draw_text(sub, cx - d2.width / 2.0, 165.0, 24.0, GRAY);
+    draw_logo(cx, 56.0, 20.0);
 
-    let mut y = 240.0;
+    let author = "by Feng-Ting Liao";
+    let d = measure_text(author, None, 34, 1.0);
+    draw_text(author, cx - d.width / 2.0, 216.0, 34.0, Color::from_rgba(226, 232, 240, 255));
+    let sub = "Rust edition · bandit-search AI";
+    let d2 = measure_text(sub, None, 21, 1.0);
+    draw_text(sub, cx - d2.width / 2.0, 246.0, 21.0, GRAY);
+
+    // Seats.
+    let mut y = 288.0;
     for p in 0..4 {
-        draw_rectangle(cx - 260.0, y, 28.0, 28.0, player_color(p));
-        draw_text(PLAYER_NAMES[p], cx - 220.0, y + 22.0, 28.0, WHITE);
-        if button(cx - 90.0, y - 4.0, 110.0, 36.0, "Human", !app.is_ai[p]) {
+        draw_block(cx - 262.0, y - 2.0, 30.0, player_color(p));
+        draw_text(PLAYER_NAMES[p], cx - 218.0, y + 21.0, 28.0, WHITE);
+        if button(cx - 90.0, y - 5.0, 110.0, 36.0, "Human", !app.is_ai[p]) {
             app.is_ai[p] = false;
         }
-        if button(cx + 30.0, y - 4.0, 110.0, 36.0, "AI", app.is_ai[p]) {
+        if button(cx + 30.0, y - 5.0, 110.0, 36.0, "AI", app.is_ai[p]) {
             app.is_ai[p] = true;
         }
-        y += 56.0;
+        y += 52.0;
     }
-    y += 10.0;
-    if button(cx - 260.0, y, 190.0, 40.0, "You vs 3 AI", false) {
+
+    // Think-time dial.
+    y += 14.0;
+    let label = if app.think_time <= 0.0 {
+        "AI think time: instant (greedy)".to_string()
+    } else {
+        format!("AI think time: {:.1} s per move", app.think_time)
+    };
+    let ld = measure_text(&label, None, 23, 1.0);
+    draw_text(&label, cx - ld.width / 2.0, y + 6.0, 23.0, Color::from_rgba(226, 232, 240, 255));
+    draw_think_slider(app, cx - 180.0, y + 30.0, 360.0);
+    let cap = "how long the AI is allowed to think per move, in seconds";
+    let cd = measure_text(cap, None, 17, 1.0);
+    draw_text(cap, cx - cd.width / 2.0, y + 82.0, 17.0, GRAY);
+
+    // Presets + start.
+    y += 110.0;
+    if button(cx - 270.0, y, 200.0, 42.0, "You vs 3 AI", false) {
         app.is_ai = [false, true, true, true];
     }
-    if button(cx - 50.0, y, 190.0, 40.0, "Watch 4 AI", false) {
+    if button(cx - 55.0, y, 200.0, 42.0, "Watch 4 AI", false) {
         app.is_ai = [true; 4];
     }
-    if button(cx + 160.0, y, 100.0, 40.0, "Start", true) || is_key_pressed(KeyCode::Enter) {
+    if button(cx + 160.0, y, 110.0, 42.0, "Start", true) || is_key_pressed(KeyCode::Enter) {
         app.start_game();
     }
-    draw_text(
-        "First piece must cover your corner. Same color touches corner-to-corner only.",
-        cx - 330.0,
-        y + 90.0,
-        20.0,
-        GRAY,
+
+    let rules = "First piece must cover your corner. Same color touches corner-to-corner only.";
+    let rd = measure_text(rules, None, 20, 1.0);
+    draw_text(rules, cx - rd.width / 2.0, y + 84.0, 20.0, GRAY);
+    let hint = "press Enter to start";
+    let hd = measure_text(hint, None, 18, 1.0);
+    draw_text(hint, cx - hd.width / 2.0, y + 110.0, 18.0, Color::from_rgba(110, 118, 140, 255));
+}
+
+// ---------------------------------------------------------------------------
+// Game over
+// ---------------------------------------------------------------------------
+
+/// Stateless confetti: every particle's position is a pure function of time.
+fn draw_confetti() {
+    let t = get_time() as f32;
+    let sw = screen_width();
+    let sh = screen_height();
+    for i in 0..140u32 {
+        let speed = 70.0 + hnoise(i, 1) * 170.0;
+        let sway = (t * (1.2 + hnoise(i, 5) * 2.2) + hnoise(i, 6) * 6.3).sin() * (12.0 + hnoise(i, 7) * 26.0);
+        let x = hnoise(i, 2) * sw + sway;
+        let y = (hnoise(i, 3) * sh + t * speed) % (sh + 40.0) - 20.0;
+        let rot = (t * (90.0 + hnoise(i, 4) * 220.0) * if hnoise(i, 8) > 0.5 { 1.0 } else { -1.0 }).to_radians();
+        let c = player_color((i % 4) as usize);
+        draw_rectangle_ex(
+            x,
+            y,
+            7.0 + hnoise(i, 9) * 6.0,
+            4.5 + hnoise(i, 10) * 4.0,
+            DrawRectangleParams { rotation: rot, color: Color { a: 0.9, ..c }, ..Default::default() },
+        );
+    }
+}
+
+/// Continuous winner fireworks + meme rotation, run every game-over frame.
+fn update_game_over(app: &mut App) {
+    let dt = get_frame_time().min(0.05);
+    app.fw_timer -= dt;
+    while app.fw_timer <= 0.0 {
+        app.fw_timer += 0.05 + app.rf() * 0.11;
+        // Rockets across the whole window, biased to the winner's color.
+        let n = if app.rf() < 0.3 { 2 } else { 1 };
+        for _ in 0..n {
+            let color = if app.rf() < 0.55 {
+                player_color(app.winner)
+            } else {
+                player_color((app.rng.next() % 4) as usize)
+            };
+            let sparks = 45 + (app.rf() * 50.0) as u32;
+            let x = app.rf() * screen_width();
+            app.launch_rocket(x, screen_height() + 12.0, color, sparks);
+        }
+    }
+    app.meme_timer -= dt;
+    if app.meme_timer <= 0.0 {
+        app.pick_meme();
+    }
+    app.update_particles();
+}
+
+/// Greedy word wrap for the meme card.
+fn wrap_lines(text: &str, size: u16, max_w: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let cand = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+        if !cur.is_empty() && measure_text(&cand, None, size, 1.0).width > max_w {
+            lines.push(cur);
+            cur = word.to_string();
+        } else {
+            cur = cand;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Speech-bubble card showing the current meme, tail pointing up at the panel.
+fn draw_meme_card(app: &App, x: f32, y: f32, w: f32) {
+    let lines = wrap_lines(&app.meme_text, 23, w - 48.0);
+    let h = 40.0 + lines.len() as f32 * 27.0 + 12.0;
+    let wc = player_color(app.winner);
+    let fade = ((4.0 - app.meme_timer) / 0.35).clamp(0.0, 1.0);
+    draw_rectangle(x + 3.0, y + 4.0, w, h, Color::new(0.0, 0.0, 0.0, 0.35));
+    draw_rectangle(x, y, w, h, Color::from_rgba(15, 18, 27, 244));
+    draw_rectangle_lines(x, y, w, h, 2.0, Color { a: 0.8, ..wc });
+    draw_triangle(
+        vec2(x + 58.0, y + 1.0),
+        vec2(x + 94.0, y + 1.0),
+        vec2(x + 76.0, y - 15.0),
+        Color::from_rgba(15, 18, 27, 244),
     );
+    draw_text("meme of the moment", x + 16.0, y + 22.0, 15.0, Color::from_rgba(110, 118, 140, 255));
+    let mut ty = y + 50.0;
+    for line in &lines {
+        let d = measure_text(line, None, 23, 1.0);
+        draw_text(line, x + (w - d.width) / 2.0, ty, 23.0, Color::new(1.0, 1.0, 1.0, fade));
+        ty += 27.0;
+    }
 }
 
 fn draw_game_over(app: &mut App) {
+    draw_header(app);
     draw_board(app);
+    draw_player_cards(app);
+    // Celebration layers go behind the panel so the ranking stays readable.
+    draw_confetti();
+    draw_particles(app);
     let bx = BOARD_X + 60.0;
     let by = BOARD_Y + 90.0;
     draw_rectangle(bx - 30.0, by - 60.0, 560.0, 440.0, Color::new(0.05, 0.06, 0.09, 0.93));
-    draw_rectangle_lines(bx - 30.0, by - 60.0, 560.0, 440.0, 2.0, Color::from_rgba(130, 140, 165, 255));
+    let t = get_time() as f32;
+    draw_rectangle_lines(bx - 30.0, by - 60.0, 560.0, 440.0, 2.0, Color::new(0.7, 0.75, 0.88, 0.6 + 0.3 * (t * 2.0).sin()));
     draw_text("Game Over", bx, by, 52.0, WHITE);
 
     let mut ranked: Vec<usize> = (0..4).collect();
@@ -424,7 +997,7 @@ fn draw_game_over(app: &mut App) {
     let mut y = by + 60.0;
     for (i, &p) in ranked.iter().enumerate() {
         let score = app.gs.score(p);
-        draw_rectangle(bx, y - 20.0, 24.0, 24.0, player_color(p));
+        draw_block(bx, y - 22.0, 26.0, player_color(p));
         let bonus = match (app.gs.squares_remaining(p), app.gs.last_piece[p]) {
             (0, Some(0)) => "  (all pieces + monomino last!)",
             (0, _) => "  (all pieces placed!)",
@@ -432,7 +1005,7 @@ fn draw_game_over(app: &mut App) {
         };
         draw_text(
             &format!("{}. {}  {}{}", i + 1, PLAYER_NAMES[p], score, bonus),
-            bx + 36.0,
+            bx + 38.0,
             y,
             30.0,
             if i == 0 { GOLD } else { WHITE },
@@ -452,8 +1025,12 @@ fn draw_game_over(app: &mut App) {
     if button(bx + 190.0, y + 44.0, 170.0, 44.0, "Menu", false) {
         app.screen = Screen::Setup;
     }
-    draw_side_panel(app);
+    draw_meme_card(app, bx - 30.0, by + 402.0, 560.0);
 }
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
 
 fn window_conf() -> Conf {
     Conf {
@@ -468,25 +1045,30 @@ fn window_conf() -> Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     let mut app = App::new();
-    // Debug/CI hooks: BLOKUS_AUTO=<seconds-per-move> starts a 4-AI game,
-    // BLOKUS_SHOT=<path> saves a screenshot shortly after startup.
+    // Debug/CI hooks: BLOKUS_AUTO=<think-seconds-per-move> starts a 4-AI game,
+    // BLOKUS_SHOT=<path> saves a screenshot at frame BLOKUS_SHOT_FRAME.
     if let Ok(auto) = std::env::var("BLOKUS_AUTO") {
         app.is_ai = [true; 4];
-        app.ai_delay = auto.parse().unwrap_or(0.0);
+        app.think_time = auto.parse().unwrap_or(0.0f32).clamp(0.0, THINK_MAX);
         app.start_game();
     }
     let shot_path = std::env::var("BLOKUS_SHOT").ok();
     let shot_frame: u32 = std::env::var("BLOKUS_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
     let mut frame: u32 = 0;
     loop {
-        clear_background(Color::from_rgba(28, 30, 38, 255));
+        clear_background(Color::from_rgba(23, 25, 33, 255));
+        draw_ambient();
         match app.screen {
             Screen::Setup => draw_setup(&mut app),
             Screen::Playing => {
                 update_playing(&mut app);
+                app.update_particles();
                 draw_playing(&mut app);
             }
-            Screen::GameOver => draw_game_over(&mut app),
+            Screen::GameOver => {
+                update_game_over(&mut app);
+                draw_game_over(&mut app);
+            }
         }
         frame += 1;
         if let Some(path) = &shot_path {
