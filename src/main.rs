@@ -15,7 +15,7 @@ mod audio;
 mod cartoons;
 mod memes;
 
-use macroquad::audio::{PlaySoundParams, play_sound, stop_sound};
+use macroquad::audio::{PlaySoundParams, play_sound, set_sound_volume, stop_sound};
 
 const CELL: f32 = 34.0;
 const BOARD_X: f32 = 30.0;
@@ -35,6 +35,9 @@ const THINK_MAX: f32 = 5.0;
 const CRAZY_MAX: f32 = 2.0;
 /// Lifetime of the block-taunt popup, seconds.
 const POPUP_TTL: f32 = 2.8;
+/// Base gameplay-music volume and the crossfade length at slot boundaries.
+const GAME_VOL: f32 = 0.35;
+const FADE_SECS: f64 = 1.5;
 
 fn player_color(p: usize) -> Color {
     match p {
@@ -138,6 +141,8 @@ struct App {
     track: MusicTrack,
     /// Index into the rotating gameplay playlist.
     game_idx: usize,
+    /// Wall-clock time when the current gameplay track started (fade-in).
+    game_started: f64,
     /// Wall-clock time when the current gameplay track ends (rotation point).
     game_next_at: f64,
 }
@@ -179,6 +184,7 @@ impl App {
             muted: false,
             track: MusicTrack::Silent,
             game_idx: 0,
+            game_started: 0.0,
             game_next_at: 0.0,
         }
     }
@@ -219,16 +225,30 @@ impl App {
                     // on a play boundary, so no mid-phrase cuts); longer
                     // pieces get one full play.
                     let plays = if *dur >= 20.0 { 1.0 } else { (20.0 / dur).floor().max(1.0) };
-                    play_sound(snd, PlaySoundParams { looped: true, volume: 0.35 });
+                    // Start silent; sync_music ramps the volume up per frame.
+                    play_sound(snd, PlaySoundParams { looped: true, volume: 0.0 });
+                    self.game_started = get_time();
                     // Plus a short breath between styles.
-                    self.game_next_at = get_time() + plays * dur + 0.7;
+                    self.game_next_at = self.game_started + plays * dur + 0.7;
                 }
             }
         }
     }
 
-    /// Keep the music in sync with the current screen, and rotate the
-    /// gameplay playlist when the current track ends. Called once per frame.
+    /// Random playlist index, uniformly chosen among the tracks OTHER than
+    /// the current one (0 if the playlist has fewer than two tracks).
+    fn pick_game_track(&mut self) -> usize {
+        let n = self.sounds.as_ref().map_or(1, |s| s.game.len().max(1));
+        if n <= 1 {
+            return 0;
+        }
+        (self.game_idx + 1 + (self.rng.next() % (n as u64 - 1)) as usize) % n
+    }
+
+    /// Keep the music in sync with the current screen, rotate the gameplay
+    /// playlist when the current slot ends, and drive the slot crossfade.
+    /// Called once per frame. Every path stops the outgoing track before a
+    /// new one starts, so at most one music track is ever audible.
     fn sync_music(&mut self) {
         let desired = match self.screen {
             Screen::Setup => MusicTrack::Menu,
@@ -238,11 +258,30 @@ impl App {
         if desired != self.track {
             self.stop_music();
             self.track = desired;
+            if desired == MusicTrack::Game {
+                // Fresh game: random first track too.
+                self.game_idx = self.pick_game_track();
+            }
             self.start_music();
         } else if self.track == MusicTrack::Game && !self.muted && get_time() >= self.game_next_at {
-            let n = self.sounds.as_ref().map_or(1, |s| s.game.len().max(1));
-            self.game_idx = (self.game_idx + 1) % n;
+            // Slot over: stop the outgoing track BEFORE advancing the index
+            // (skipping this stop is what used to stack tracks every ~20 s),
+            // then pick a random different track.
+            self.stop_music();
+            self.game_idx = self.pick_game_track();
             self.start_music();
+        }
+        // Crossfade: ramp gameplay volume up over the first FADE_SECS of a
+        // slot and back down over the final FADE_SECS before the rotation.
+        if self.track == MusicTrack::Game && !self.muted {
+            if let Some(s) = &self.sounds {
+                if let Some((snd, _)) = s.game.get(self.game_idx) {
+                    let now = get_time();
+                    let fade_in = ((now - self.game_started) / FADE_SECS).clamp(0.0, 1.0);
+                    let fade_out = ((self.game_next_at - now) / FADE_SECS).clamp(0.0, 1.0);
+                    set_sound_volume(snd, GAME_VOL * fade_in.min(fade_out) as f32);
+                }
+            }
         }
     }
 
@@ -289,6 +328,21 @@ impl App {
 
     fn toast(&mut self, msg: String) {
         self.toasts.push((msg, 2.2));
+    }
+
+    /// Abandon whatever is on screen and return to the setup menu. Drops any
+    /// AI worker handle (its result is ignored, same pattern as start_game);
+    /// sync_music swaps the track on the next frame.
+    fn abandon_to_menu(&mut self) {
+        self.ai_handle = None;
+        self.sel = None;
+        self.paused = false;
+        self.pace = 0.0;
+        self.toasts.clear();
+        self.particles.clear();
+        self.popup = None;
+        self.roll_setup_meme();
+        self.screen = Screen::Setup;
     }
 
     fn start_game(&mut self) {
@@ -752,7 +806,9 @@ fn draw_tray(app: &mut App) {
 // Player cards + side panel
 // ---------------------------------------------------------------------------
 
-fn draw_player_cards(app: &App) {
+/// Player cards + controls block; returns true if the in-game Menu button
+/// (shown only while playing) was clicked.
+fn draw_player_cards(app: &App) -> bool {
     let t = get_time() as f32;
     let x = SIDE_X;
     draw_text("Players", x, TRAY_Y - 18.0, 26.0, LIGHTGRAY);
@@ -817,6 +873,12 @@ fn draw_player_cards(app: &App) {
     if app.paused {
         draw_text("PAUSED", x, y + 44.0, 20.0, GOLD);
     }
+    // In-game Menu button: abandon the game and return to setup.
+    let mut menu_clicked = false;
+    if matches!(app.screen, Screen::Playing) {
+        menu_clicked = button(x, y + 58.0, SIDE_W, 36.0, "Menu", false);
+    }
+    menu_clicked
 }
 
 // ---------------------------------------------------------------------------
@@ -951,7 +1013,7 @@ fn draw_playing(app: &mut App) {
     draw_header(app);
     draw_board(app);
     draw_tray(app);
-    draw_player_cards(app);
+    let menu_clicked = draw_player_cards(app);
 
     let p = app.gs.current;
     // Ghost + placement for the human player.
@@ -991,6 +1053,10 @@ fn draw_playing(app: &mut App) {
         ty += 44.0;
     }
     app.toasts.retain(|(_, ttl)| *ttl > 0.0);
+
+    if menu_clicked {
+        app.abandon_to_menu();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1131,16 +1197,19 @@ fn draw_setup(app: &mut App) {
     let cd2 = measure_text(cap2, None, 16, 1.0);
     draw_text(cap2, rx + (sw2 - cd2.width) / 2.0, y + 84.0, 16.0, Color::from_rgba(120, 128, 148, 255));
 
-    // Presets + start.
+    // Presets + start + exit.
     y += 110.0;
-    if button(cx - 270.0, y, 200.0, 42.0, "You vs 3 AI", false) {
+    if button(cx - 335.0, y, 200.0, 42.0, "You vs 3 AI", false) {
         app.is_ai = [false, true, true, true];
     }
-    if button(cx - 55.0, y, 200.0, 42.0, "Watch 4 AI", false) {
+    if button(cx - 120.0, y, 200.0, 42.0, "Watch 4 AI", false) {
         app.is_ai = [true; 4];
     }
-    if button(cx + 160.0, y, 110.0, 42.0, "Start", true) || is_key_pressed(KeyCode::Enter) {
+    if button(cx + 95.0, y, 110.0, 42.0, "Start", true) || is_key_pressed(KeyCode::Enter) {
         app.start_game();
+    }
+    if button(cx + 220.0, y, 110.0, 42.0, "Exit", false) {
+        std::process::exit(0);
     }
 
     let rules = "First piece must cover your corner. Same color touches corner-to-corner only.";
@@ -1303,8 +1372,7 @@ fn draw_game_over(app: &mut App) {
         app.start_game();
     }
     if button(bx + 190.0, y + 44.0, 170.0, 44.0, "Menu", false) {
-        app.roll_setup_meme();
-        app.screen = Screen::Setup;
+        app.abandon_to_menu();
     }
     draw_meme_card(app, bx - 30.0, by + 402.0, 560.0);
 }
