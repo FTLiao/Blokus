@@ -11,14 +11,15 @@
 
 🟦 🟨 🟥 🟩
 
-**The classic four-player territory war — rebuilt in Rust, with a bandit-search AI, fireworks, and memes.**
+**The classic four-player territory war — rebuilt in Rust, with a bandit-search AI, fireworks, cartoons, and chiptune sound.**
 
 ![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)
 ![Engine](https://img.shields.io/badge/engine-bitboards-blueviolet)
 ![Board](https://img.shields.io/badge/board-official_20×20-blue)
 ![AI](https://img.shields.io/badge/AI-UCB1_bandit_search-red)
-![Memes](https://img.shields.io/badge/memes-30_in_database-ff69b4)
-![Tests](https://img.shields.io/badge/tests-12_passing-brightgreen)
+![Cartoons](https://img.shields.io/badge/cartoons-24_hand--coded-ff69b4)
+![Audio](https://img.shields.io/badge/audio-synthesized_chiptune-9cf)
+![Tests](https://img.shields.io/badge/tests-13_passing-brightgreen)
 
 *by **Feng-Ting Liao***
 
@@ -52,16 +53,22 @@ Blokus rules, the official ones:
 | `Esc` | put the piece back |
 | `Space` | pause the AI |
 | `Up` / `Down` | AI think time |
+| `M` | mute sound |
 
 ## 🎆 The show
 
 Blokus is a game about ruining your friends' plans, and the game now celebrates accordingly:
 
-- **Block a corner, get fireworks.** Every move is audited for how many opponent growth-corners it stole. One or two blocked corners earns a burst on the spot; five or more launches a full rocket volley in the blocker's color. Block nothing, get nothing. Earn your pyrotechnics.
-- **Win, get a festival.** The victory screen is a continuous fireworks barrage biased to the winner's color, plus confetti, plus a **meme card** drawn from a 30-entry in-game meme database — a fresh one every four seconds, personalized with the winner's name.
+- **Block a corner, get fireworks — and a cartoon.** Every move is audited for how many opponent growth-corners it stole. One or two blocked corners earns a burst on the spot; five or more launches a full rocket volley in the blocker's color, and every block pops a **cartoon taunt card** ("Red builds fences, not friendships."). Block nothing, get nothing. Earn your pyrotechnics.
+- **Win, get a festival.** The victory screen is a continuous fireworks barrage biased to the winner's color, plus confetti, plus a **cartoon meme card** — caption from a 30-entry meme database, art from a 24-cartoon gallery, re-rolled every four seconds and personalized with the winner's name.
+- **24 hand-coded cartoons.** No image files anywhere — every cartoon is animated vector art drawn live from Rust code: the crying blocked block, "this is fine" amid the flames, the RIP-corner tombstone, the lonely monomino, the stonks chart, the shuriken ninja... A random one greets you on the title screen too.
+- **Chiptune soundtrack, synthesized at startup.** A built-in square/triangle/noise synthesizer renders seven original MIDI-style pieces — a laid-back menu theme, a victory fanfare, and a **five-track gameplay playlist that rotates through wildly different genres**: chip-pop, four-on-the-floor **club techno**, an E7-vamp **funk** groove with ghost-note bass, a walking-bass **lindy hop** swing number, and a drum-free **classical waltz** in 3/4. Plus a punchy **bang** every time corners get blocked (louder for bigger blocks). Zero audio assets shipped; it's all math. `M` mutes.
+- **The craziness dial.** A front-page slider from *zen* (0%) to *LUDICROUS* (200%) scales every particle, rocket, confetto, and popup in the game. Your GPU, your rules.
 
 <div align="center">
-<img src="docs/ui-winner.png" alt="Winner celebration: mega fireworks, confetti, and a meme card" width="900"/>
+<img src="docs/ui-winner.png" alt="Winner celebration: mega fireworks, confetti, and a cartoon meme card" width="900"/>
+<br/><br/>
+<img src="docs/ui-cartoons.png" alt="The 24-cartoon gallery" width="900"/>
 </div>
 
 ## 🧠 The AI
@@ -79,7 +86,7 @@ Want the math? The full algorithm and benchmark methodology are written up in th
 
 ```sh
 cargo run --release --example selfplay   # strength + budget-compliance benchmark
-cargo test                               # rules + AI test suite (12 tests)
+cargo test                               # rules + AI + audio test suite (13 tests)
 ```
 
 ## 📜 The story
@@ -88,7 +95,9 @@ cargo test                               # rules + AI test suite (12 tests)
 
 **The decade-long off-by-one.** v1's board was declared `Board[21][21]` — one row and one column more than the official game, quietly warping every match played on it. It survived every playtest. It outlived the compiler it was built with. It is fixed now. Rest in peace, row 21.
 
-**v2 — the translation.** The entire game — engine, UI, AI — was translated from C++ to Rust by **Fable 5** (Claude, Anthropic's Mythos-class model). The rewrite swapped `graphics.h` for [macroquad](https://macroquad.rs), linked lists for bitboards, and the wandering-edge AI for a full-board evaluator — then a second pass upgraded that evaluator into the bandit search above, put the author's name in lights on the title screen, and added the fireworks. The `.wav` file did not make the jump. It is missed. 🎵
+**v2 — the translation.** The entire game — engine, UI, AI — was translated from C++ to Rust by **Fable 5** (Claude, Anthropic's Mythos-class model). The rewrite swapped `graphics.h` for [macroquad](https://macroquad.rs), linked lists for bitboards, and the wandering-edge AI for a full-board evaluator — then a second pass upgraded that evaluator into the bandit search above, put the author's name in lights on the title screen, and added the fireworks. The `.wav` file did not make the jump. It was missed. 🎵
+
+**v2.2 — the music came back.** Not as a file, but as an instrument: the game now carries its own tiny synthesizer and composes its soundtrack from note data at startup, the way v1's chunky `graphics.h` sprites were reborn as hand-coded vector cartoons. Nothing was restored; everything was reincarnated. And where v1 had one `.wav` on repeat, v2.2 runs a five-genre set — techno, funk, swing, a waltz — because a territory war deserves a house band.
 
 ## 🏗️ Under the hood
 
@@ -97,11 +106,13 @@ src/
 ├── pieces.rs   the 21 polyominoes + precomputed orientations (deduped rotations/flips)
 ├── game.rs     bitboard rules engine — legality, move generation, official scoring
 ├── ai.rs       greedy evaluator + UCB1 bandit search (mobility / denial / tempo)
-├── memes.rs    the meme database (30 entries, {winner}-aware)
+├── memes.rs    the meme + taunt databases (30 memes, 13 taunts, {winner}-aware)
+├── cartoons.rs 24 animated vector cartoons, drawn live from code
+├── audio.rs    chiptune synthesizer — menu/win loops, a 5-genre gameplay playlist, the block bang
 └── main.rs     macroquad UI — title, play, autoplay, particles, celebrations
 ```
 
-Debug hooks for the curious: `BLOKUS_AUTO=<think-seconds>` boots straight into a 4-AI game, `BLOKUS_SHOT=shot.png` (with `BLOKUS_SHOT_FRAME=<n>`) captures a frame — it's how every screenshot in this README was taken.
+Debug hooks for the curious: `BLOKUS_AUTO=<think-seconds>` boots straight into a 4-AI game, `BLOKUS_SHOT=shot.png` (with `BLOKUS_SHOT_FRAME=<n>`) captures a frame, `BLOKUS_MUTE=1` starts silent — it's how every screenshot in this README was taken.
 
 <div align="center">
 <img src="docs/ui-title.png" alt="Title screen: block-mosaic logo, by Feng-Ting Liao, think-time dial" width="700"/>

@@ -11,7 +11,11 @@ use blokus::pieces::{NUM_PIECES, flip_horizontal, pieces, rotate_cw};
 use macroquad::prelude::*;
 use std::thread::JoinHandle;
 
+mod audio;
+mod cartoons;
 mod memes;
+
+use macroquad::audio::{PlaySoundParams, play_sound, stop_sound};
 
 const CELL: f32 = 34.0;
 const BOARD_X: f32 = 30.0;
@@ -27,6 +31,10 @@ const CARD_GAP: f32 = 10.0;
 /// Fixed pacing gap between moves so watch mode reads well at 0 think time.
 const PACE_GAP: f32 = 0.25;
 const THINK_MAX: f32 = 5.0;
+/// Visual craziness dial range (0 = zen, 2 = ludicrous).
+const CRAZY_MAX: f32 = 2.0;
+/// Lifetime of the block-taunt popup, seconds.
+const POPUP_TTL: f32 = 2.8;
 
 fn player_color(p: usize) -> Color {
     match p {
@@ -65,6 +73,15 @@ struct Sel {
     cells: Vec<(i8, i8)>,
 }
 
+/// Cartoon + taunt card shown when a move blocks opponent corners.
+struct Popup {
+    text: String,
+    sub: String,
+    cartoon: usize,
+    color: Color,
+    ttl: f32,
+}
+
 /// One firework particle. Sparks fly ballistically and fade out; rockets
 /// (burst != None) ascend and explode into a spray of sparks when their
 /// life runs out.
@@ -96,15 +113,41 @@ struct App {
     /// Time since the last move; the next AI move waits for PACE_GAP.
     pace: f32,
     paused: bool,
-    drag_slider: bool,
+    /// Which slider is currently being dragged (by widget id), if any.
+    drag_slider: Option<u8>,
+    /// Spectacle multiplier, 0.0 (zen) to 2.0 (ludicrous).
+    craziness: f32,
     toasts: Vec<(String, f32)>,
     particles: Vec<Particle>,
+    /// Cartoon taunt card for the latest corner-blocking move.
+    popup: Option<Popup>,
     /// Countdown to the next celebration rocket on the game-over screen.
     fw_timer: f32,
     winner: usize,
     meme_text: String,
+    meme_cartoon: usize,
     /// Countdown until the next meme rotates in.
     meme_timer: f32,
+    /// Decorative meme for the setup screen (rolled on entering it).
+    setup_meme: String,
+    setup_cartoon: usize,
+    /// Chiptune tracks + SFX, synthesized at startup.
+    sounds: Option<audio::Sounds>,
+    muted: bool,
+    /// Which music loop is currently playing.
+    track: MusicTrack,
+    /// Index into the rotating gameplay playlist.
+    game_idx: usize,
+    /// Wall-clock time when the current gameplay track ends (rotation point).
+    game_next_at: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MusicTrack {
+    Silent,
+    Menu,
+    Game,
+    Win,
 }
 
 impl App {
@@ -120,14 +163,123 @@ impl App {
             ai_started: 0.0,
             pace: 0.0,
             paused: false,
-            drag_slider: false,
+            drag_slider: None,
+            craziness: 1.0,
             toasts: Vec::new(),
             particles: Vec::new(),
+            popup: None,
             fw_timer: 0.0,
             winner: 0,
             meme_text: String::new(),
+            meme_cartoon: 0,
             meme_timer: 4.0,
+            setup_meme: String::new(),
+            setup_cartoon: 0,
+            sounds: None,
+            muted: false,
+            track: MusicTrack::Silent,
+            game_idx: 0,
+            game_next_at: 0.0,
         }
+    }
+
+    // -- Music + SFX ------------------------------------------------------
+
+    /// Stop whatever music is currently playing.
+    fn stop_music(&mut self) {
+        let Some(s) = &self.sounds else { return };
+        match self.track {
+            MusicTrack::Silent => {}
+            MusicTrack::Menu => stop_sound(&s.menu),
+            MusicTrack::Win => stop_sound(&s.win),
+            MusicTrack::Game => {
+                if let Some((snd, _)) = s.game.get(self.game_idx) {
+                    stop_sound(snd);
+                }
+            }
+        }
+    }
+
+    /// Start the music for the current `self.track` (respects mute).
+    /// For gameplay this plays the current playlist entry once and schedules
+    /// the next rotation; menu/win tracks loop in place.
+    fn start_music(&mut self) {
+        if self.muted {
+            return;
+        }
+        let Some(s) = &self.sounds else { return };
+        match self.track {
+            MusicTrack::Silent => {}
+            MusicTrack::Menu => play_sound(&s.menu, PlaySoundParams { looped: true, volume: 0.45 }),
+            MusicTrack::Win => play_sound(&s.win, PlaySoundParams { looped: true, volume: 0.55 }),
+            MusicTrack::Game => {
+                if let Some((snd, dur)) = s.game.get(self.game_idx) {
+                    // Each playlist slot is at most 20 s: short pieces repeat
+                    // for as many full plays as fit (looped playback, stopped
+                    // on a play boundary, so no mid-phrase cuts); longer
+                    // pieces get one full play.
+                    let plays = if *dur >= 20.0 { 1.0 } else { (20.0 / dur).floor().max(1.0) };
+                    play_sound(snd, PlaySoundParams { looped: true, volume: 0.35 });
+                    // Plus a short breath between styles.
+                    self.game_next_at = get_time() + plays * dur + 0.7;
+                }
+            }
+        }
+    }
+
+    /// Keep the music in sync with the current screen, and rotate the
+    /// gameplay playlist when the current track ends. Called once per frame.
+    fn sync_music(&mut self) {
+        let desired = match self.screen {
+            Screen::Setup => MusicTrack::Menu,
+            Screen::Playing => MusicTrack::Game,
+            Screen::GameOver => MusicTrack::Win,
+        };
+        if desired != self.track {
+            self.stop_music();
+            self.track = desired;
+            self.start_music();
+        } else if self.track == MusicTrack::Game && !self.muted && get_time() >= self.game_next_at {
+            let n = self.sounds.as_ref().map_or(1, |s| s.game.len().max(1));
+            self.game_idx = (self.game_idx + 1) % n;
+            self.start_music();
+        }
+    }
+
+    fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        if self.muted {
+            self.stop_music();
+        } else {
+            self.start_music();
+        }
+        self.toast(if self.muted { "Sound off".into() } else { "Sound on".into() });
+    }
+
+    /// The corner-block bang; louder for bigger blocks.
+    fn play_bang(&mut self, blocked: usize) {
+        if self.muted {
+            return;
+        }
+        if let Some(s) = &self.sounds {
+            let volume = (0.5 + 0.12 * blocked as f32).min(1.0);
+            play_sound(&s.bang, PlaySoundParams { looped: false, volume });
+        }
+    }
+
+    /// Roll a fresh decorative meme + cartoon for the setup screen. Called
+    /// on entering the screen only, never per frame.
+    fn roll_setup_meme(&mut self) {
+        let mut raw = memes::pick(self.rng.next());
+        // Prefer captions without the {winner} placeholder on the front page.
+        for _ in 0..8 {
+            if !raw.contains("{winner}") {
+                break;
+            }
+            raw = memes::pick(self.rng.next());
+        }
+        self.setup_meme = raw.replace("{winner}", "The winner");
+        self.setup_cartoon = (self.rng.next() % cartoons::COUNT.max(1) as u64) as usize;
     }
 
     /// Uniform random float in [0, 1).
@@ -147,6 +299,7 @@ impl App {
         self.ai_handle = None; // detach any stale worker; its result is ignored
         self.toasts.clear();
         self.particles.clear();
+        self.popup = None;
         self.screen = Screen::Playing;
     }
 
@@ -169,6 +322,7 @@ impl App {
     fn pick_meme(&mut self) {
         let raw = memes::pick(self.rng.next());
         self.meme_text = raw.replace("{winner}", PLAYER_NAMES[self.winner]);
+        self.meme_cartoon = (self.rng.next() % cartoons::COUNT.max(1) as u64) as usize;
         self.meme_timer = 4.0;
     }
 
@@ -247,34 +401,56 @@ impl App {
         }
     }
 
-    /// Fireworks scaled to how many opponent corners this move just blocked,
-    /// bursting at the blocked cells in the blocking player's color.
+    /// Fireworks + cartoon taunt popup scaled to how many opponent corners
+    /// this move just blocked, bursting at the blocked cells in the blocking
+    /// player's color. Purely visual; everything scales with the craziness
+    /// dial (at 0.0 only an informational toast survives for big blocks).
     fn celebrate_block(&mut self, p: usize, cells: &[(i32, i32)]) {
         let b = cells.len();
         if b == 0 {
             return;
         }
-        let per: u32 = match b {
-            1..=2 => 26,
-            3..=4 => 42,
-            _ => 55,
+        self.play_bang(b);
+        let cz = self.craziness;
+        if cz <= 0.0 {
+            if b >= 3 {
+                self.toast(format!("{} blocked {b} corners!", PLAYER_NAMES[p]));
+            }
+            return;
+        }
+        let base: f32 = match b {
+            1..=2 => 26.0,
+            3..=4 => 42.0,
+            _ => 55.0,
         };
+        let per = (base * cz).round() as u32;
         let color = player_color(p);
         for &(r, c) in cells {
             let (x, y) = cell_xy(r, c);
             self.spawn_burst(x + CELL / 2.0, y + CELL / 2.0, color, per);
         }
-        if b >= 3 {
-            self.toast(format!("{} blocked {b} corners!", PLAYER_NAMES[p]));
-        }
         if b >= 5 {
             // Crazy volley: rockets fired up from below the board.
             let side = N as f32 * CELL;
-            for _ in 0..4 {
+            let sparks = (60.0 * cz.min(1.5)) as u32;
+            for _ in 0..(4.0 * cz).round() as u32 {
                 let x = BOARD_X + self.rf() * side;
-                self.launch_rocket(x, BOARD_Y + side + 10.0, color, 60);
+                self.launch_rocket(x, BOARD_Y + side + 10.0, color, sparks);
             }
         }
+        // Cartoon taunt popup (folds in the old ">=3 corners" toast).
+        let phrase = if b == 1 { "1 corner".to_string() } else { format!("{b} corners") };
+        let taunt = memes::pick_taunt(self.rng.next())
+            .replace("{blocker}", PLAYER_NAMES[p])
+            .replace("{n}", &phrase);
+        let cartoon = (self.rng.next() % cartoons::COUNT.max(1) as u64) as usize;
+        self.popup = Some(Popup {
+            text: taunt,
+            sub: format!("{} blocked {phrase}!", PLAYER_NAMES[p]),
+            cartoon,
+            color,
+            ttl: POPUP_TTL,
+        });
     }
 }
 
@@ -311,6 +487,51 @@ fn draw_particles(app: &App) {
     }
 }
 
+/// Cartoon taunt popup over the top of the board. Springy pop-in, shrink +
+/// fade out; visual only (never touches input, pacing, or the AI thread).
+fn draw_block_popup(app: &mut App) {
+    let dt = get_frame_time();
+    if let Some(pp) = &mut app.popup {
+        pp.ttl -= dt;
+        if pp.ttl <= 0.0 {
+            app.popup = None;
+        }
+    }
+    let Some(pp) = &app.popup else { return };
+    let age = POPUP_TTL - pp.ttl;
+    let t1 = (age / 0.35).min(1.0);
+    let mut scale = 1.0 - (1.0 - t1).powi(3) + 0.16 * (1.0 - t1) * (t1 * 12.0).sin();
+    let alpha = (pp.ttl / 0.4).clamp(0.0, 1.0);
+    scale *= alpha.sqrt();
+    if scale <= 0.03 {
+        return;
+    }
+    let lines = wrap_lines(&pp.text, 24, 320.0);
+    let content_h = lines.len() as f32 * 27.0 + 30.0;
+    let w0 = 490.0;
+    let h0 = (content_h + 42.0).max(118.0);
+    let ccx = BOARD_X + N as f32 * CELL / 2.0;
+    let ccy = BOARD_Y + 88.0;
+    let (w, h) = (w0 * scale, h0 * scale);
+    let (x, y) = (ccx - w / 2.0, ccy - h / 2.0);
+    draw_rectangle(x + 4.0, y + 5.0, w, h, Color::new(0.0, 0.0, 0.0, 0.4 * alpha));
+    draw_rectangle(x, y, w, h, Color::new(0.05, 0.06, 0.1, 0.93 * alpha));
+    draw_rectangle_lines(x, y, w, h, 3.0, Color { a: 0.9 * alpha, ..pp.color });
+    cartoons::draw(pp.cartoon, x + 66.0 * scale, ccy, 96.0 * scale, get_time() as f32);
+    let tx = x + 132.0 * scale;
+    let tw = (w0 - 152.0) * scale;
+    let mut ty = ccy - content_h / 2.0 * scale + 18.0 * scale;
+    for line in &lines {
+        let fs = 24.0 * scale;
+        let d = measure_text(line, None, fs.max(1.0) as u16, 1.0);
+        draw_text(line, tx + (tw - d.width) / 2.0, ty, fs, Color::new(1.0, 1.0, 1.0, alpha));
+        ty += 27.0 * scale;
+    }
+    let fs = 17.0 * scale;
+    let d = measure_text(&pp.sub, None, fs.max(1.0) as u16, 1.0);
+    draw_text(&pp.sub, tx + (tw - d.width) / 2.0, ty + 4.0 * scale, fs, Color { a: 0.9 * alpha, ..pp.color });
+}
+
 // ---------------------------------------------------------------------------
 // Shared drawing helpers
 // ---------------------------------------------------------------------------
@@ -329,12 +550,15 @@ fn draw_block(x: f32, y: f32, s: f32, color: Color) {
     draw_rectangle(x + s * 0.26, y + s * 0.26, s * 0.48, s * 0.48, dim(color, 0.86));
 }
 
-/// Slow drifting translucent squares behind everything.
-fn draw_ambient() {
+/// Slow drifting translucent squares behind everything; count and alpha
+/// scale with the craziness dial (minimal but present at zen).
+fn draw_ambient(cz: f32) {
     let t = get_time() as f32;
     let sw = screen_width();
     let sh = screen_height();
-    for i in 0..18u32 {
+    let count = (4.0 + 14.0 * cz).round() as u32;
+    let alpha_scale = (0.5 + 0.5 * cz).min(1.5);
+    for i in 0..count {
         let size = 50.0 + hnoise(i, 0) * 150.0;
         let x = (hnoise(i, 1) * sw + t * (4.0 + hnoise(i, 2) * 11.0)) % (sw + size) - size;
         let y = (hnoise(i, 3) * sh + t * (2.0 + hnoise(i, 4) * 7.0)) % (sh + size) - size;
@@ -347,7 +571,7 @@ fn draw_ambient() {
             size,
             DrawRectangleParams {
                 rotation: rot,
-                color: Color { a: 0.045 + hnoise(i, 7) * 0.035, ..c },
+                color: Color { a: (0.045 + hnoise(i, 7) * 0.035) * alpha_scale, ..c },
                 ..Default::default()
             },
         );
@@ -573,13 +797,14 @@ fn draw_player_cards(app: &App) {
     y += 22.0;
     draw_text("Controls", x, y, 24.0, LIGHTGRAY);
     y += 26.0;
-    let lines: [&str; 6] = [
+    let lines: [&str; 7] = [
         "Click piece, then board",
         "R / right-click: rotate",
         "F: flip",
         "Esc: put piece back",
         "Space: pause AI",
         "Up/Down: AI think time",
+        "M: mute sound",
     ];
     for l in lines {
         draw_text(l, x, y, 19.0, GRAY);
@@ -588,8 +813,9 @@ fn draw_player_cards(app: &App) {
     y += 18.0;
     let think = if app.think_time <= 0.0 { "instant".to_string() } else { format!("{:.1}s / move", app.think_time) };
     draw_text(&format!("AI think time: {think}"), x, y, 20.0, LIGHTGRAY);
+    draw_text(&format!("Craziness: {:.0}%", app.craziness * 100.0), x, y + 22.0, 17.0, GRAY);
     if app.paused {
-        draw_text("PAUSED", x, y + 24.0, 20.0, GOLD);
+        draw_text("PAUSED", x, y + 44.0, 20.0, GOLD);
     }
 }
 
@@ -741,6 +967,7 @@ fn draw_playing(app: &mut App) {
     }
 
     draw_particles(app);
+    draw_block_popup(app);
 
     if app.paused {
         let msg = "PAUSED — Space to resume";
@@ -751,9 +978,9 @@ fn draw_playing(app: &mut App) {
         draw_text(msg, cx, cy, 30.0, GOLD);
     }
 
-    // Toasts.
+    // Toasts (dodge the popup zone while a taunt card is up).
     let dt = get_frame_time();
-    let mut ty = 110.0;
+    let mut ty = if app.popup.is_some() { 250.0 } else { 110.0 };
     for (msg, ttl) in &mut app.toasts {
         *ttl -= dt;
         let a = (*ttl / 0.5).min(1.0);
@@ -794,34 +1021,56 @@ fn draw_logo(cx: f32, top: f32, s: f32) {
     }
 }
 
-fn draw_think_slider(app: &mut App, x: f32, y: f32, w: f32) {
+/// Generic draggable slider snapped to `step`; returns the updated value.
+/// `drag` holds the id of whichever slider currently owns the mouse.
+fn slider_widget(drag: &mut Option<u8>, id: u8, x: f32, y: f32, w: f32, max: f32, step: f32, mut value: f32, accent: Color) -> f32 {
     let (mx, my) = mouse_position();
     let hot = mx >= x - 14.0 && mx <= x + w + 14.0 && (my - y).abs() <= 16.0;
     if hot && is_mouse_button_pressed(MouseButton::Left) {
-        app.drag_slider = true;
+        *drag = Some(id);
     }
-    if !is_mouse_button_down(MouseButton::Left) {
-        app.drag_slider = false;
+    if !is_mouse_button_down(MouseButton::Left) && *drag == Some(id) {
+        *drag = None;
     }
-    if app.drag_slider {
-        let v = ((mx - x) / w * THINK_MAX).clamp(0.0, THINK_MAX);
-        app.think_time = (v * 2.0).round() / 2.0; // snap to 0.5 s steps
+    if *drag == Some(id) {
+        let v = ((mx - x) / w * max).clamp(0.0, max);
+        value = (v / step).round() * step;
     }
-    let frac = app.think_time / THINK_MAX;
+    let frac = (value / max).clamp(0.0, 1.0);
     // Track, fill, ticks, knob.
     draw_rectangle(x, y - 3.0, w, 6.0, Color::from_rgba(24, 27, 35, 255));
-    draw_rectangle(x, y - 3.0, frac * w, 6.0, Color::from_rgba(96, 165, 250, 255));
-    for i in 0..=10 {
-        let tx = x + i as f32 / 10.0 * w;
+    draw_rectangle(x, y - 3.0, frac * w, 6.0, accent);
+    let ticks = (max / step).round().max(1.0) as i32;
+    for i in 0..=ticks {
+        let tx = x + i as f32 / ticks as f32 * w;
         draw_rectangle(tx - 1.0, y + 6.0, 2.0, 5.0, Color::from_rgba(96, 104, 126, 255));
     }
     let kx = x + frac * w;
     draw_circle(kx, y, 12.0, Color::new(0.0, 0.0, 0.0, 0.4));
     draw_circle(kx, y, 11.0, Color::from_rgba(226, 232, 240, 255));
-    draw_circle(kx, y, 6.5, Color::from_rgba(59, 130, 246, 255));
-    draw_text("0 (instant)", x - 8.0, y + 30.0, 17.0, GRAY);
-    let d = measure_text("5.0 s", None, 17, 1.0);
-    draw_text("5.0 s", x + w - d.width + 8.0, y + 30.0, 17.0, GRAY);
+    draw_circle(kx, y, 6.5, accent);
+    value
+}
+
+/// Decorative random meme card in the free top-right corner of the setup
+/// screen (rolled once per screen entry, not per frame).
+fn draw_setup_meme(app: &App) {
+    let x = 1006.0;
+    let w = 262.0;
+    let y = 44.0;
+    let lines = wrap_lines(&app.setup_meme, 16, w - 28.0);
+    let h = 158.0 + lines.len() as f32 * 20.0 + 6.0;
+    draw_rectangle(x + 3.0, y + 4.0, w, h, Color::new(0.0, 0.0, 0.0, 0.3));
+    draw_rectangle(x, y, w, h, Color::new(0.06, 0.07, 0.11, 0.85));
+    draw_rectangle_lines(x, y, w, h, 1.0, Color::from_rgba(90, 96, 116, 255));
+    draw_text("random meme", x + 14.0, y + 20.0, 14.0, Color::from_rgba(110, 118, 140, 255));
+    cartoons::draw(app.setup_cartoon, x + w / 2.0, y + 88.0, 112.0, get_time() as f32);
+    let mut ty = y + 168.0;
+    for line in &lines {
+        let d = measure_text(line, None, 16, 1.0);
+        draw_text(line, x + (w - d.width) / 2.0, ty, 16.0, Color::from_rgba(190, 196, 210, 255));
+        ty += 20.0;
+    }
 }
 
 fn draw_setup(app: &mut App) {
@@ -849,19 +1098,38 @@ fn draw_setup(app: &mut App) {
         y += 52.0;
     }
 
-    // Think-time dial.
+    // Dials: AI think time (left) and visual craziness (right).
     y += 14.0;
-    let label = if app.think_time <= 0.0 {
+    let sw2 = 320.0;
+    let lx = cx - 385.0;
+    let rx = cx + 65.0;
+    let ink = Color::from_rgba(226, 232, 240, 255);
+    let tl = if app.think_time <= 0.0 {
         "AI think time: instant (greedy)".to_string()
     } else {
         format!("AI think time: {:.1} s per move", app.think_time)
     };
-    let ld = measure_text(&label, None, 23, 1.0);
-    draw_text(&label, cx - ld.width / 2.0, y + 6.0, 23.0, Color::from_rgba(226, 232, 240, 255));
-    draw_think_slider(app, cx - 180.0, y + 30.0, 360.0);
-    let cap = "how long the AI is allowed to think per move, in seconds";
-    let cd = measure_text(cap, None, 17, 1.0);
-    draw_text(cap, cx - cd.width / 2.0, y + 82.0, 17.0, GRAY);
+    let d = measure_text(&tl, None, 22, 1.0);
+    draw_text(&tl, lx + (sw2 - d.width) / 2.0, y + 6.0, 22.0, ink);
+    let cl = format!("Visual craziness: {:.0}%", app.craziness * 100.0);
+    let d = measure_text(&cl, None, 22, 1.0);
+    draw_text(&cl, rx + (sw2 - d.width) / 2.0, y + 6.0, 22.0, ink);
+    let v = slider_widget(&mut app.drag_slider, 0, lx, y + 32.0, sw2, THINK_MAX, 0.5, app.think_time, Color::from_rgba(96, 165, 250, 255));
+    app.think_time = v;
+    let v = slider_widget(&mut app.drag_slider, 1, rx, y + 32.0, sw2, CRAZY_MAX, 0.25, app.craziness, Color::from_rgba(250, 128, 90, 255));
+    app.craziness = v;
+    draw_text("0 (instant)", lx, y + 62.0, 16.0, GRAY);
+    let d = measure_text("5.0 s", None, 16, 1.0);
+    draw_text("5.0 s", lx + sw2 - d.width, y + 62.0, 16.0, GRAY);
+    draw_text("zen", rx, y + 62.0, 16.0, GRAY);
+    let d = measure_text("LUDICROUS", None, 16, 1.0);
+    draw_text("LUDICROUS", rx + sw2 - d.width, y + 62.0, 16.0, GRAY);
+    let cap = "how long the AI may think per move, seconds";
+    let cd = measure_text(cap, None, 16, 1.0);
+    draw_text(cap, lx + (sw2 - cd.width) / 2.0, y + 84.0, 16.0, Color::from_rgba(120, 128, 148, 255));
+    let cap2 = "fireworks, confetti, memes: how much?";
+    let cd2 = measure_text(cap2, None, 16, 1.0);
+    draw_text(cap2, rx + (sw2 - cd2.width) / 2.0, y + 84.0, 16.0, Color::from_rgba(120, 128, 148, 255));
 
     // Presets + start.
     y += 110.0;
@@ -881,6 +1149,8 @@ fn draw_setup(app: &mut App) {
     let hint = "press Enter to start";
     let hd = measure_text(hint, None, 18, 1.0);
     draw_text(hint, cx - hd.width / 2.0, y + 110.0, 18.0, Color::from_rgba(110, 118, 140, 255));
+
+    draw_setup_meme(app);
 }
 
 // ---------------------------------------------------------------------------
@@ -888,11 +1158,13 @@ fn draw_setup(app: &mut App) {
 // ---------------------------------------------------------------------------
 
 /// Stateless confetti: every particle's position is a pure function of time.
-fn draw_confetti() {
+/// Density scales with the craziness dial.
+fn draw_confetti(cz: f32) {
     let t = get_time() as f32;
     let sw = screen_width();
     let sh = screen_height();
-    for i in 0..140u32 {
+    let count = (140.0 * cz).round().min(300.0) as u32;
+    for i in 0..count {
         let speed = 70.0 + hnoise(i, 1) * 170.0;
         let sway = (t * (1.2 + hnoise(i, 5) * 2.2) + hnoise(i, 6) * 6.3).sin() * (12.0 + hnoise(i, 7) * 26.0);
         let x = hnoise(i, 2) * sw + sway;
@@ -912,18 +1184,21 @@ fn draw_confetti() {
 /// Continuous winner fireworks + meme rotation, run every game-over frame.
 fn update_game_over(app: &mut App) {
     let dt = get_frame_time().min(0.05);
+    // Launch rate, volley size, and spark counts all scale with craziness
+    // (clamped away from 0 so zen mode stays sparse instead of dividing by 0).
+    let cz = app.craziness;
     app.fw_timer -= dt;
     while app.fw_timer <= 0.0 {
-        app.fw_timer += 0.05 + app.rf() * 0.11;
+        app.fw_timer += (0.05 + app.rf() * 0.11) / cz.max(0.12);
         // Rockets across the whole window, biased to the winner's color.
-        let n = if app.rf() < 0.3 { 2 } else { 1 };
+        let n = if app.rf() < 0.3 * cz { 2 } else { 1 };
         for _ in 0..n {
             let color = if app.rf() < 0.55 {
                 player_color(app.winner)
             } else {
                 player_color((app.rng.next() % 4) as usize)
             };
-            let sparks = 45 + (app.rf() * 50.0) as u32;
+            let sparks = ((45.0 + app.rf() * 50.0) * (0.35 + 0.65 * cz)) as u32;
             let x = app.rf() * screen_width();
             app.launch_rocket(x, screen_height() + 12.0, color, sparks);
         }
@@ -954,10 +1229,13 @@ fn wrap_lines(text: &str, size: u16, max_w: f32) -> Vec<String> {
     lines
 }
 
-/// Speech-bubble card showing the current meme, tail pointing up at the panel.
+/// Speech-bubble card showing the current meme (cartoon + caption, re-rolled
+/// together every ~4 s), tail pointing up at the ranking panel.
 fn draw_meme_card(app: &App, x: f32, y: f32, w: f32) {
-    let lines = wrap_lines(&app.meme_text, 23, w - 48.0);
-    let h = 40.0 + lines.len() as f32 * 27.0 + 12.0;
+    let text_x = x + 190.0;
+    let text_w = w - 210.0;
+    let lines = wrap_lines(&app.meme_text, 23, text_w);
+    let h = (70.0 + lines.len() as f32 * 27.0).max(172.0);
     let wc = player_color(app.winner);
     let fade = ((4.0 - app.meme_timer) / 0.35).clamp(0.0, 1.0);
     draw_rectangle(x + 3.0, y + 4.0, w, h, Color::new(0.0, 0.0, 0.0, 0.35));
@@ -970,10 +1248,13 @@ fn draw_meme_card(app: &App, x: f32, y: f32, w: f32) {
         Color::from_rgba(15, 18, 27, 244),
     );
     draw_text("meme of the moment", x + 16.0, y + 22.0, 15.0, Color::from_rgba(110, 118, 140, 255));
-    let mut ty = y + 50.0;
+    // Cartoon on the left, caption centered in the remaining width.
+    cartoons::draw(app.meme_cartoon, x + 98.0, y + h / 2.0 + 8.0, 142.0, get_time() as f32);
+    let text_h = lines.len() as f32 * 27.0;
+    let mut ty = y + (h - text_h) / 2.0 + 20.0;
     for line in &lines {
         let d = measure_text(line, None, 23, 1.0);
-        draw_text(line, x + (w - d.width) / 2.0, ty, 23.0, Color::new(1.0, 1.0, 1.0, fade));
+        draw_text(line, text_x + (text_w - d.width) / 2.0, ty, 23.0, Color::new(1.0, 1.0, 1.0, fade));
         ty += 27.0;
     }
 }
@@ -983,7 +1264,7 @@ fn draw_game_over(app: &mut App) {
     draw_board(app);
     draw_player_cards(app);
     // Celebration layers go behind the panel so the ranking stays readable.
-    draw_confetti();
+    draw_confetti(app.craziness);
     draw_particles(app);
     let bx = BOARD_X + 60.0;
     let by = BOARD_Y + 90.0;
@@ -999,17 +1280,16 @@ fn draw_game_over(app: &mut App) {
         let score = app.gs.score(p);
         draw_block(bx, y - 22.0, 26.0, player_color(p));
         let bonus = match (app.gs.squares_remaining(p), app.gs.last_piece[p]) {
-            (0, Some(0)) => "  (all pieces + monomino last!)",
-            (0, _) => "  (all pieces placed!)",
+            (0, Some(0)) => "all pieces + monomino last!",
+            (0, _) => "all pieces placed!",
             _ => "",
         };
-        draw_text(
-            &format!("{}. {}  {}{}", i + 1, PLAYER_NAMES[p], score, bonus),
-            bx + 38.0,
-            y,
-            30.0,
-            if i == 0 { GOLD } else { WHITE },
-        );
+        let main = format!("{}. {}  {}", i + 1, PLAYER_NAMES[p], score);
+        draw_text(&main, bx + 38.0, y, 30.0, if i == 0 { GOLD } else { WHITE });
+        if !bonus.is_empty() {
+            let mw = measure_text(&main, None, 30, 1.0).width;
+            draw_text(bonus, bx + 48.0 + mw, y - 2.0, 16.0, Color::from_rgba(240, 210, 120, 255));
+        }
         y += 46.0;
     }
     draw_text(
@@ -1023,6 +1303,7 @@ fn draw_game_over(app: &mut App) {
         app.start_game();
     }
     if button(bx + 190.0, y + 44.0, 170.0, 44.0, "Menu", false) {
+        app.roll_setup_meme();
         app.screen = Screen::Setup;
     }
     draw_meme_card(app, bx - 30.0, by + 402.0, 560.0);
@@ -1045,8 +1326,14 @@ fn window_conf() -> Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     let mut app = App::new();
+    app.sounds = Some(audio::load().await);
+    app.roll_setup_meme();
     // Debug/CI hooks: BLOKUS_AUTO=<think-seconds-per-move> starts a 4-AI game,
-    // BLOKUS_SHOT=<path> saves a screenshot at frame BLOKUS_SHOT_FRAME.
+    // BLOKUS_SHOT=<path> saves a screenshot at frame BLOKUS_SHOT_FRAME,
+    // BLOKUS_MUTE=1 starts with sound off.
+    if std::env::var("BLOKUS_MUTE").is_ok() {
+        app.muted = true;
+    }
     if let Ok(auto) = std::env::var("BLOKUS_AUTO") {
         app.is_ai = [true; 4];
         app.think_time = auto.parse().unwrap_or(0.0f32).clamp(0.0, THINK_MAX);
@@ -1057,7 +1344,11 @@ async fn main() {
     let mut frame: u32 = 0;
     loop {
         clear_background(Color::from_rgba(23, 25, 33, 255));
-        draw_ambient();
+        if is_key_pressed(KeyCode::M) {
+            app.toggle_mute();
+        }
+        app.sync_music();
+        draw_ambient(app.craziness);
         match app.screen {
             Screen::Setup => draw_setup(&mut app),
             Screen::Playing => {

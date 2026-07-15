@@ -38,3 +38,26 @@ pub const MEMES: &[&str] = &[
 pub fn pick(rng_value: u64) -> &'static str {
     MEMES[(rng_value % MEMES.len() as u64) as usize]
 }
+
+/// Short punchy taunts for the block popup. `{blocker}` is replaced with the
+/// blocking color's name; `{n}` with a phrase like "1 corner" / "4 corners".
+pub const BLOCK_TAUNTS: &[&str] = &[
+    "{blocker} just ate {n}. Nom.",
+    "Corner? What corner?",
+    "Denied. So, so denied.",
+    "{blocker} says: not in MY neighborhood.",
+    "That corner is a museum now. No touching.",
+    "GPS rerouting... no path found.",
+    "{blocker} builds fences, not friendships.",
+    "Oops. Your expansion plan just tripped.",
+    "{n} confiscated. Zero remorse.",
+    "This area is under new management.",
+    "Somebody call a lawyer. That was theft.",
+    "{blocker} heard you liked that diagonal.",
+    "Road closed. Forever. Have a nice day.",
+];
+
+/// Deterministic pick from a random value (uniform over the taunts).
+pub fn pick_taunt(rng_value: u64) -> &'static str {
+    BLOCK_TAUNTS[(rng_value % BLOCK_TAUNTS.len() as u64) as usize]
+}
